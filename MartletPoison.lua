@@ -1,12 +1,14 @@
--- MartletPoison 0.1.0
--- 所见即所涂的涂毒助手。基于 EzPoison (Sunelegy/qyj) 的成熟逻辑改造:
--- 涂抹连招/武器附魔解析/pfUI皮肤移植自 EzPoison, UI 按 MartletPoison README 新设计实现。
+-- MartletPoison 0.2.0 看板版
+-- 所见即所涂的涂毒助手。基于 EzPoison (Sunelegy/qyj) 的成熟逻辑改造。
+-- 双看板(主手/副手) + 四角信息(次数/时间/等级/库存) + 有货/全量列表。
+-- 面板显示武器状态而非背包库存; 点击=涂抹; 无影响行为的隐藏状态。
 
 -- 命名空间: 本客户端环境已预置全局 MP(字符串), 必须用插件全名并做类型防护
 if type(MartletPoison) ~= "table" then MartletPoison = {} end
 local MP = MartletPoison
 
 MP.api = getfenv()
+MP.INF_CHAR = "∞" -- 时间型无次数概念; 若客户端字形缺失, 改成 "--"
 
 -- ==================== 数据表 ====================
 -- 种类定义 (id 与 EzPoison 保持一致, 便于对照)
@@ -47,7 +49,7 @@ MP.RANKS = {
 	[15] = { { "", 23123 } },
 }
 
--- README 固定顺序: 速效→致命→致伤→致残→麻痹→腐蚀→溶解→煽动 | 致密→神圣→元素→致密平衡 | 油
+-- 看板/列表的展示顺序: 速效→致命→致伤→致残→麻痹→腐蚀→溶解→煽动 | 致密→神圣→元素→致密平衡 | 油
 local ORDER_INDEX = { [1]=1, [2]=2, [4]=3, [3]=4, [6]=5, [5]=6, [8]=7, [7]=8,
 	[9]=9, [12]=10, [11]=11, [10]=12, [13]=13, [14]=14, [15]=15 }
 
@@ -105,13 +107,15 @@ end
 
 MP.Work = {
 	slotInfo = {},      -- GetWeaponEnchantInfo 缓存
-	activeMH = nil,     -- 主手当前附魔的种类 id (tooltip 解析)
-	activeOH = nil,
+	activeMH = nil, rankMH = nil,   -- 主手当前附魔种类+等级 (tooltip 解析)
+	activeOH = nil, rankOH = nil,
 	counts = {},        -- 背包各种类总数
 	rankCounts = {},    -- 背包各等级数量 [type][rankIdx]
 	NAME2ENTRY = {},    -- 小写物品名 -> {t=种类, r=等级序号}
 	UsableOrder = {},   -- 排序后的可用种类列表
-	Icons = {},         -- [type] = button
+	ListMode = nil,     -- nil/"stock"/"all" (会话态, 不存档)
+	DashIcons = {},     -- ["MH"/"OH"] = 看板按钮
+	ListIcons = {},     -- [type] = 列表按钮
 	Time = 0,
 	Tick = 0,
 	iSCasting = nil,
@@ -132,7 +136,7 @@ local function buildNameIndex()
 	end
 end
 
--- 可用种类 (按职业过滤 + README 固定顺序)
+-- 可用种类 (按职业过滤 + 固定顺序)
 local function buildUsableOrder()
 	local _, playerClassEN = UnitClass("player")
 	local usable = {}
@@ -154,13 +158,11 @@ local function initConfig()
 			Scale = 1,
 			LockPosition = 0,
 			isVisible = 1,
-			Hidden = {},        -- [type]=1 收进抽屉
-			DrawerOpen = 0,
-			LastMH = 0,         -- 该手最后涂的种类 (仅显示用)
+			LastMH = 0,         -- 该手最后涂的种类 (看板显示+补涂用)
 			LastOH = 0,
 			MaxCharges = {},    -- 涂抹时自动标定的满次数
 			MaxDuration = {},   -- 满时长 ms
-			TimeWarn = 5,       -- 时间 <N 分钟时角标切时间并标红
+			TimeWarn = 5,       -- 时间 <N 分钟时时间角标红 (阈值可调)
 		}
 	end
 	if not MPcfg.TimeWarn then MPcfg.TimeWarn = 5 end
@@ -221,7 +223,7 @@ function MP:FindItem(typeId, skipTopRank)
 end
 
 -- ==================== 武器附魔状态 ====================
--- 解析武器 tooltip, 返回当前附魔的种类 id (移植自 EzPoison 的武器行匹配)
+-- 解析武器 tooltip, 返回 种类id, 等级序号 (等级来自行内后缀, 高等级优先避免 II/III 子串误匹配)
 function MP:ScanHand(slot)
 	local parser = MP.Parser
 	parser:SetOwner(UIParent, "ANCHOR_NONE")
@@ -239,9 +241,19 @@ function MP:ScanHand(slot)
 				local lowerText = gsub(string.lower(line), "-", "")
 				for _, t in ipairs(MP.Work.UsableOrder) do
 					local sign = MP.SIGNS[t] or MP.Types[t].name
-					if string.find(lowerText, gsub(string.lower(sign), "-", "")) then
+					if string.find(lowerText, gsub(string.lower(sign), "-", ""), 1, true) then
+						local rank = table.getn(MP.RANKS[t]) -- 无后缀 = 基础等级(列表末位)
+						for r = 1, table.getn(MP.RANKS[t]) do
+							if MP.RANKS[t][r][1] ~= "" then
+								local full = gsub(string.lower(MP.Types[t].name .. MP.RANKS[t][r][1]), "-", "")
+								if string.find(lowerText, full, 1, true) then
+									rank = r
+									break
+								end
+							end
+						end
 						parser:Hide()
-						return t
+						return t, rank
 					end
 				end
 			end
@@ -251,18 +263,12 @@ function MP:ScanHand(slot)
 	return nil
 end
 
--- 角标文字与颜色: 返回 text, r, g, b 或 nil(无角标)
+-- ==================== 颜色/格式 ====================
 local COLOR_GREEN  = { 0, 1, 0 }
 local COLOR_YELLOW = { 1, 1, 0 }
 local COLOR_ORANGE = { 1, 0.5, 0 }
 local COLOR_RED    = { 1, 0, 0 }
-
-local function pctColor(pct)
-	if pct <= 0 then return COLOR_RED end
-	if pct <= 0.25 then return COLOR_ORANGE end
-	if pct <= 0.5 then return COLOR_YELLOW end
-	return COLOR_GREEN
-end
+local COLOR_GRAY   = { 0.75, 0.75, 0.75 }
 
 local function fmtTime(ms)
 	local s = math.floor(ms / 1000 + 0.5)
@@ -272,87 +278,184 @@ local function fmtTime(ms)
 	return s .. "s"
 end
 
-function MP:HandBadge(typeId, hand)
+local function pctColor(pct)
+	if pct <= 0 then return COLOR_RED end
+	if pct <= 0.25 then return COLOR_ORANGE end
+	if pct <= 0.5 then return COLOR_YELLOW end
+	return COLOR_GREEN
+end
+
+-- 余量档位 (次数与时间取更紧迫的那个)
+local function marginPct(typeId, exp, chg)
+	local p1, p2
+	if typeId <= 8 and chg and chg > 0 then
+		local max = MPcfg.MaxCharges[typeId] or 30
+		p1 = chg / max
+	end
+	if exp and exp > 0 then
+		local max = MPcfg.MaxDuration[typeId] or 1800000
+		p2 = exp / max
+	end
+	if p1 and p2 then
+		if p1 < p2 then return p1 else return p2 end
+	elseif p1 then return p1
+	elseif p2 then return p2 end
+	return 1
+end
+
+-- ==================== 看板四角 ====================
+-- 返回: typeId, 次数文字+RGB, 时间文字+RGB, 等级文字, 库存
+function MP:DashCorners(hand)
 	local si = MP.Work.slotInfo
-	local has, exp, chg, active, last
+	local has, exp, chg
 	if hand == "MH" then
 		has, exp, chg = si[1], si[2], si[3]
-		active, last = MP.Work.activeMH, MPcfg.LastMH
 	else
 		has, exp, chg = si[4], si[5], si[6]
-		active, last = MP.Work.activeOH, MPcfg.LastOH
 	end
+	local active, rank
+	if hand == "MH" then
+		active, rank = MP.Work.activeMH, MP.Work.rankMH
+	else
+		active, rank = MP.Work.activeOH, MP.Work.rankOH
+	end
+	local last
+	if hand == "MH" then last = MPcfg.LastMH or 0 else last = MPcfg.LastOH or 0 end
+
+	local typeId = nil
+	if has and active then
+		typeId = active
+	elseif last ~= 0 then
+		typeId = last
+	end
+	if not typeId then
+		return nil -- 全空: 无记忆
+	end
+
+	local isPoison = typeId <= 8
+	local cT, cR, cG, cB
+	local tT, tR, tG, tB
+	local rankT
 
 	if has and active == typeId then
-		local warn = (MPcfg.TimeWarn or 5) * 60000
-		if exp and exp < warn then
-			-- 附魔马上超时, 次数再多也没意义: 切剩余时间并标红
-			return fmtTime(exp), COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
-		elseif chg and chg > 0 then
-			local max = MPcfg.MaxCharges[typeId] or (typeId <= 8 and 30 or nil)
-			local col = pctColor(max and (chg / max) or 1)
-			return tostring(chg), col[1], col[2], col[3]
-		elseif exp then
+		if isPoison and chg and chg > 0 then
+			local max = MPcfg.MaxCharges[typeId] or 30
+			local col = pctColor(chg / max)
+			cT, cR, cG, cB = tostring(chg), col[1], col[2], col[3]
+		elseif isPoison then
+			cT, cR, cG, cB = "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
+		else
+			cT, cR, cG, cB = MP.INF_CHAR, COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3]
+		end
+		if exp then
 			local max = MPcfg.MaxDuration[typeId] or 1800000
 			local col = pctColor(exp / max)
-			return fmtTime(exp), col[1], col[2], col[3]
+			tT, tR, tG, tB = fmtTime(exp), col[1], col[2], col[3]
+		else
+			tT, tR, tG, tB = "", 1, 1, 1
 		end
-		return "", COLOR_GREEN[1], COLOR_GREEN[2], COLOR_GREEN[3]
+		if rank then
+			local suf = MP.RANKS[typeId][rank][1]
+			rankT = gsub(suf, " ", "")
+			if rankT == "" then rankT = "-" end
+		else
+			rankT = "-"
+		end
+	else
+		-- 空手有记忆: 红 0 常驻, 方便无脑补涂
+		if isPoison then
+			cT, cR, cG, cB = "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
+		else
+			cT, cR, cG, cB = MP.INF_CHAR, COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3]
+		end
+		tT, tR, tG, tB = "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
+		rankT = "-"
 	end
 
-	if (not has) and last == typeId then
-		-- 这只手空着, 上次涂的是它: 停一个红色 0, 方便无脑补涂
-		return "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
-	end
+	local stock = MP.Work.counts[typeId] or 0
+	return typeId, cT, cR, cG, cB, tT, tR, tG, tB, rankT, stock
+end
 
-	return nil
+-- 剩余量文字 (tooltip 用)
+function MP:RemainText(typeId, hand)
+	local si = MP.Work.slotInfo
+	local exp, chg
+	if hand == "MH" then
+		exp, chg = si[2], si[3]
+	else
+		exp, chg = si[5], si[6]
+	end
+	local warn = (MPcfg.TimeWarn or 5) * 60000
+	if exp and exp < warn then
+		return fmtTime(exp)
+	elseif chg and chg > 0 then
+		return tostring(chg)
+	elseif exp then
+		return fmtTime(exp)
+	end
+	return "?"
 end
 
 -- ==================== 图标状态刷新 ====================
 function MP:UpdateIcons()
 	local si = MP.Work.slotInfo
-	for _, t in ipairs(MP.Work.UsableOrder) do
-		local btn = MP.Work.Icons[t]
-		if btn then
-			-- 满值标定: 附魔刚涂上时次数/时间即满值 (自校准, 含乌龟服自定义物品)
-			local active = nil
-			if si[1] and MP.Work.activeMH == t then active = "MH" end
-			if si[4] and MP.Work.activeOH == t then active = active or "OH" end
-			if active == "MH" then
-				if si[3] and si[3] > 0 and (not MPcfg.MaxCharges[t] or si[3] > MPcfg.MaxCharges[t]) then MPcfg.MaxCharges[t] = si[3] end
-				if si[2] and (not MPcfg.MaxDuration[t] or si[2] > MPcfg.MaxDuration[t]) then MPcfg.MaxDuration[t] = si[2] end
-			elseif active == "OH" then
-				if si[6] and si[6] > 0 and (not MPcfg.MaxCharges[t] or si[6] > MPcfg.MaxCharges[t]) then MPcfg.MaxCharges[t] = si[6] end
-				if si[5] and (not MPcfg.MaxDuration[t] or si[5] > MPcfg.MaxDuration[t]) then MPcfg.MaxDuration[t] = si[5] end
-			end
 
-			-- 角标
-			local mhText, mhR, mhG, mhB = MP:HandBadge(t, "MH")
-			if mhText then
-				btn.bMH:SetText(mhText)
-				btn.bMH:SetTextColor(mhR, mhG, mhB)
-			else
-				btn.bMH:SetText("")
+	-- 满值标定: 附魔刚涂上时次数/时间即满值 (自校准, 含乌龟服自定义物品)
+	local hands = { "MH", "OH" }
+	for _, hand in ipairs(hands) do
+		local has, exp, chg, active
+		if hand == "MH" then
+			has, exp, chg, active = si[1], si[2], si[3], MP.Work.activeMH
+		else
+			has, exp, chg, active = si[4], si[5], si[6], MP.Work.activeOH
+		end
+		if has and active then
+			if chg and chg > 0 and (not MPcfg.MaxCharges[active] or chg > MPcfg.MaxCharges[active]) then
+				MPcfg.MaxCharges[active] = chg
 			end
-			local ohText, ohR, ohG, ohB = MP:HandBadge(t, "OH")
-			if ohText then
-				btn.bOH:SetText(ohText)
-				btn.bOH:SetTextColor(ohR, ohG, ohB)
-			else
-				btn.bOH:SetText("")
-			end
-
-			-- 库存 (白色常显)
-			local stock = MP.Work.counts[t] or 0
-			btn.bStock:SetText(tostring(stock))
-
-			-- 亮度: 背包没货降亮度; 抽屉内去色
-			btn:SetAlpha(stock == 0 and 0.35 or 1)
-			if btn.Icon.SetDesaturated then
-				btn.Icon:SetDesaturated(MPcfg.Hidden[t] == 1 and 1 or nil)
+			if exp and (not MPcfg.MaxDuration[active] or exp > MPcfg.MaxDuration[active]) then
+				MPcfg.MaxDuration[active] = exp
 			end
 		end
 	end
+
+	-- 看板四角
+	for _, hand in ipairs(hands) do
+		local dash = MP.Work.DashIcons[hand]
+		if dash then
+			local typeId, cT, cR, cG, cB, tT, tR, tG, tB, rankT, stock = MP:DashCorners(hand)
+			if typeId then
+				local active
+				if hand == "MH" then active = MP.Work.activeMH else active = MP.Work.activeOH end
+				dash.typeId = typeId
+				dash.Icon:SetTexture(MP.Types[typeId].icon)
+				dash:SetAlpha(active and 1 or 0.55)
+				dash.cTL:SetText(cT); dash.cTL:SetTextColor(cR, cG, cB)
+				dash.cTR:SetText(tT); dash.cTR:SetTextColor(tR, tG, tB)
+				dash.cBL:SetText(rankT); dash.cBL:SetTextColor(0.85, 0.85, 0.85)
+				dash.cBR:SetText(tostring(stock)); dash.cBR:SetTextColor(1, 1, 1)
+			else
+				dash.typeId = nil
+				dash.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
+				dash:SetAlpha(0.4)
+				dash.cTL:SetText(""); dash.cTR:SetText("")
+				dash.cBL:SetText("-"); dash.cBL:SetTextColor(0.6, 0.6, 0.6)
+				dash.cBR:SetText("0"); dash.cBR:SetTextColor(1, 1, 1)
+			end
+		end
+	end
+
+	-- 列表项: 只显示库存
+	for _, t in ipairs(MP.Work.UsableOrder) do
+		local item = MP.Work.ListIcons[t]
+		if item then
+			local c = MP.Work.counts[t] or 0
+			item.bStock:SetText(tostring(c))
+			item:SetAlpha(c == 0 and 0.35 or 1)
+		end
+	end
+
+	MP:Layout() -- 有货模式的显隐随库存变化
 end
 
 function MP:Refresh()
@@ -360,9 +463,19 @@ function MP:Refresh()
 	MP.Work.slotInfo[1], MP.Work.slotInfo[2], MP.Work.slotInfo[3], MP.Work.slotInfo[4], MP.Work.slotInfo[5], MP.Work.slotInfo[6], MP.Work.slotInfo[7] =
 		s1, s2, s3, s4, s5, s6, s7
 
-	MP.Work.activeMH = s1 and MP:ScanHand(16) or nil
-	MP.Work.activeOH = s4 and MP:ScanHand(17) or nil
-	-- 角标跟随真实状态: 附魔在 -> 记忆同步为它
+	if s1 then
+		local t, r = MP:ScanHand(16)
+		MP.Work.activeMH, MP.Work.rankMH = t, r
+	else
+		MP.Work.activeMH, MP.Work.rankMH = nil, nil
+	end
+	if s4 then
+		local t, r = MP:ScanHand(17)
+		MP.Work.activeOH, MP.Work.rankOH = t, r
+	else
+		MP.Work.activeOH, MP.Work.rankOH = nil, nil
+	end
+	-- 记忆跟随真实状态: 附魔在 -> 记忆同步为它
 	if MP.Work.activeMH then MPcfg.LastMH = MP.Work.activeMH end
 	if MP.Work.activeOH then MPcfg.LastOH = MP.Work.activeOH end
 
@@ -382,7 +495,8 @@ function MP:Apply(typeId, hand)
 	-- 双致命/双腐蚀: 副手自动低一级 (移植自 EzPoison 的 offhandLevelDown 规则)
 	local skipTop = false
 	if hand == "OH" and (typeId == 2 or typeId == 5) then
-		if MP.Work.activeMH == typeId or (MPcfg.LastMH or 0) == typeId then
+		local mhActive = MP.Work.activeMH
+		if mhActive == typeId or (MPcfg.LastMH or 0) == typeId then
 			skipTop = true
 		end
 	end
@@ -415,65 +529,111 @@ function MP:Apply(typeId, hand)
 	MP.Work.dirty = 1
 end
 
+-- 看板左键: 补涂该手上次的毒 (带防浪费护栏)
+function MP:Reapply(hand)
+	local last
+	if hand == "MH" then last = MPcfg.LastMH or 0 else last = MPcfg.LastOH or 0 end
+	if last == 0 then
+		logMsg(hand == "MH" and "主手还没涂过毒" or "副手还没涂过毒")
+		return
+	end
+	local active
+	if hand == "MH" then active = MP.Work.activeMH else active = MP.Work.activeOH end
+	if active == last then
+		local si = MP.Work.slotInfo
+		local exp, chg
+		if hand == "MH" then
+			exp, chg = si[2], si[3]
+		else
+			exp, chg = si[5], si[6]
+		end
+		if marginPct(last, exp, chg) > 0.25 then
+			logMsg(MP.Types[last].name .. " 余量还充足, 不重涂 (橙/红时才会补)")
+			return
+		end
+	end
+	MP:Apply(last, hand)
+end
+
+-- ==================== 列表 ====================
+function MP:ToggleList(mode)
+	if MP.Work.ListMode == mode then
+		MP.Work.ListMode = nil
+	else
+		MP.Work.ListMode = mode
+	end
+	MP:Layout()
+end
+
 -- ==================== UI 构建 ====================
-local ICON = 32
-local STEP = 36
-local PAD = 5
+local PAD = 5      -- 面板内边距
+local DASH = 40    -- 看板图标尺寸
+local LICON = 32   -- 列表图标尺寸
+local STEP = 36    -- 列表项步进
+local GAP = 6      -- 看板间距 / 行距
+
+-- 展开态绿色边框 (兼容 pfUI 的独立 backdrop)
+local function setGroupBorder(frame, r, g, b, a)
+	if frame.backdrop and frame.backdrop.SetBackdropBorderColor then
+		frame.backdrop:SetBackdropBorderColor(r, g, b, a)
+	end
+	if frame.SetBackdropBorderColor then
+		frame:SetBackdropBorderColor(r, g, b, a)
+	end
+end
 
 function MP:Layout()
 	local frame = MP.ConfigFrame
-	if not frame or table.getn(MP.Work.UsableOrder) == 0 then return end
+	if not frame then return end
+	local dashMH = MP.Work.DashIcons.MH
+	local dashOH = MP.Work.DashIcons.OH
+	if not dashMH or not dashOH then return end
 
-	local main, drawer = {}, {}
-	for _, t in ipairs(MP.Work.UsableOrder) do
-		if MPcfg.Hidden[t] == 1 then table.insert(drawer, t) else table.insert(main, t) end
-	end
+	dashMH:ClearAllPoints()
+	dashMH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD, -PAD)
+	dashOH:ClearAllPoints()
+	dashOH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + DASH + GAP, -PAD)
 
-	local drawerOpen = MPcfg.DrawerOpen == 1 and table.getn(drawer) > 0
-
-	-- 主行
-	for i = 1, table.getn(main) do
-		local btn = MP.Work.Icons[main[i]]
-		btn:ClearAllPoints()
-		btn:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + (i - 1) * STEP, -PAD)
-		btn:Show()
-	end
-	-- 抽屉行 (紧贴主行下方, 行距 4px)
-	for i = 1, table.getn(drawer) do
-		local btn = MP.Work.Icons[drawer[i]]
-		if drawerOpen then
-			btn:ClearAllPoints()
-			btn:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + (i - 1) * STEP, -(PAD + ICON + 4))
-			btn:Show()
-		else
-			btn:Hide()
+	local mode = MP.Work.ListMode
+	local listW = 0
+	if mode then
+		local x = PAD
+		for _, t in ipairs(MP.Work.UsableOrder) do
+			local item = MP.Work.ListIcons[t]
+			local show = (mode == "all") or ((MP.Work.counts[t] or 0) > 0)
+			if show then
+				item:ClearAllPoints()
+				item:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -(PAD + DASH + GAP))
+				item:Show()
+				x = x + STEP
+			else
+				item:Hide()
+			end
+		end
+		listW = x - STEP + LICON + PAD
+	else
+		-- 收起: 藏掉所有列表项, 防止上一模式的图标残留
+		for _, t in ipairs(MP.Work.UsableOrder) do
+			local item = MP.Work.ListIcons[t]
+			if item then item:Hide() end
 		end
 	end
 
-	-- 抽屉开关 (常驻可见, 吸取方案小点的教训)
-	local chev = frame.Chev
-	chev:ClearAllPoints()
-	if table.getn(main) > 0 then
-		chev:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + table.getn(main) * STEP, -(PAD + (ICON - 16) / 2))
-	else
-		chev:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD, -(PAD + (ICON - 16) / 2))
-	end
-	if drawerOpen then
-		chev:SetNormalTexture("Interface\\Buttons\\UI-MinusButton-Up")
-	else
-		chev:SetNormalTexture("Interface\\Buttons\\UI-PlusButton-Up")
-	end
-
-	local w1 = PAD + table.getn(main) * STEP + 16 + 4 + PAD
-	local w2 = drawerOpen and (PAD + table.getn(drawer) * STEP + PAD) or 0
-	local width = w1 > w2 and w1 or w2
-	local height = PAD + ICON + PAD
-	if drawerOpen then height = PAD + ICON + 4 + ICON + PAD end
+	local groupW = PAD + DASH + GAP + DASH + PAD
+	local width = groupW > listW and groupW or listW
+	local height = PAD + DASH + PAD
+	if mode then height = PAD + DASH + GAP + STEP + PAD end
 	frame:SetWidth(width)
 	frame:SetHeight(height)
+
+	if mode then
+		setGroupBorder(frame, 0, 1, 0, 1)
+	else
+		setGroupBorder(frame, 1, 1, 1, 1)
+	end
 end
 
-function MP:ShowTooltip(btn, typeId)
+function MP:ShowTooltip(btn, typeId, hint)
 	MP:BagScan()
 	local t = MP.Types[typeId]
 	GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
@@ -493,42 +653,34 @@ function MP:ShowTooltip(btn, typeId)
 		GameTooltip:AddLine("背包没有", 0.6, 0.6, 0.6)
 	end
 
-	-- 武器状态
-	local mhText = MP:HandBadge(typeId, "MH")
-	if mhText then
-		if mhText == "0" then
-			GameTooltip:AddLine("主手: 已用尽 (上次涂的)", 1, 0, 0)
-		else
-			GameTooltip:AddLine("主手: 剩 " .. mhText, 0.4, 0.8, 0.4)
+	-- 两手状态 (含等级)
+	if MP.Work.slotInfo[1] and MP.Work.activeMH == typeId then
+		local rankT = "-"
+		if MP.Work.rankMH then
+			local suf = MP.RANKS[typeId][MP.Work.rankMH][1]
+			rankT = gsub(suf, " ", "")
+			if rankT == "" then rankT = "-" end
 		end
+		GameTooltip:AddLine("主手: 已涂 " .. rankT .. " · 剩 " .. MP:RemainText(typeId, "MH"), 0.4, 0.8, 0.4)
+	elseif (MPcfg.LastMH or 0) == typeId then
+		GameTooltip:AddLine("主手: 已用尽 (上次涂的)", 1, 0, 0)
 	end
-	local ohText = MP:HandBadge(typeId, "OH")
-	if ohText then
-		if ohText == "0" then
-			GameTooltip:AddLine("副手: 已用尽 (上次涂的)", 1, 0, 0)
-		else
-			GameTooltip:AddLine("副手: 剩 " .. ohText, 0.4, 0.8, 0.4)
+	if MP.Work.slotInfo[4] and MP.Work.activeOH == typeId then
+		local rankT = "-"
+		if MP.Work.rankOH then
+			local suf = MP.RANKS[typeId][MP.Work.rankOH][1]
+			rankT = gsub(suf, " ", "")
+			if rankT == "" then rankT = "-" end
 		end
+		GameTooltip:AddLine("副手: 已涂 " .. rankT .. " · 剩 " .. MP:RemainText(typeId, "OH"), 0.4, 0.8, 0.4)
+	elseif (MPcfg.LastOH or 0) == typeId then
+		GameTooltip:AddLine("副手: 已用尽 (上次涂的)", 1, 0, 0)
 	end
 
-	if MPcfg.Hidden[typeId] == 1 then
-		GameTooltip:AddLine("左键 主手 · 右键 副手 · 中键 放回主行", 0.6, 0.6, 0.6)
-	else
-		GameTooltip:AddLine("左键 主手 · 右键 副手 · 中键 收进抽屉", 0.6, 0.6, 0.6)
+	if hint then
+		GameTooltip:AddLine(hint, 0.6, 0.6, 0.6)
 	end
 	GameTooltip:Show()
-end
-
-local function ToggleHidden(typeId)
-	if MPcfg.Hidden[typeId] == 1 then
-		MPcfg.Hidden[typeId] = nil
-		logMsg(MP.Types[typeId].name .. " 已放回主行")
-	else
-		MPcfg.Hidden[typeId] = 1
-		logMsg(MP.Types[typeId].name .. " 已收进抽屉")
-	end
-	MP:Layout()
-	MP:UpdateIcons()
 end
 
 function MP:ConfigureUI()
@@ -566,26 +718,33 @@ function MP:ConfigureUI()
 
 	buildUsableOrder()
 
-	-- 图标工厂: 循环控制变量经由参数传入 (本客户端 Lua 的 for 控制变量
-	-- 在循环结束后于闭包中读到 nil, 参数局部变量则永远正确)
-	local function createIcon(frame, t)
+	-- 工厂函数: 迭代变量一律经参数传入 (本客户端 for 控制变量在循环后的闭包里读到 nil)
+	local function createDash(hand)
 		local btn = CreateFrame("Button", nil, frame)
-		btn.typeId = t
-		btn:SetWidth(ICON)
-		btn:SetHeight(ICON)
-		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp", "MiddleButtonUp")
+		btn.hand = hand
+		btn:SetWidth(DASH)
+		btn:SetHeight(DASH)
+		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 		btn:SetScript("OnClick", function()
 			local b = tostring(arg1 or "")
 			if b == "LeftButton" or b == "LeftButtonUp" then
-				MP:Apply(t, "MH")
+				MP:Reapply(hand)
 			elseif b == "RightButton" or b == "RightButtonUp" then
-				MP:Apply(t, "OH")
-			elseif b == "MiddleButton" or b == "MiddleButtonUp" then
-				ToggleHidden(t)
+				if IsShiftKeyDown() then
+					MP:ToggleList("all")
+				else
+					MP:ToggleList("stock")
+				end
 			end
 		end)
 		btn:SetScript("OnEnter", function()
-			MP:ShowTooltip(btn, t)
+			if btn.typeId then
+				MP:ShowTooltip(btn, btn.typeId, "左键 补涂 | 右键 有货列表 | Shift+右键 全部")
+			else
+				GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
+				GameTooltip:AddLine("空槽 - 先从列表涂一次毒", 0.8, 0.8, 0.8)
+				GameTooltip:Show()
+			end
 		end)
 		btn:SetScript("OnLeave", function()
 			GameTooltip:Hide()
@@ -596,50 +755,75 @@ function MP:ConfigureUI()
 
 		btn.Icon = btn:CreateTexture(nil, "ARTWORK")
 		btn.Icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
-		btn.Icon:SetWidth(ICON)
-		btn.Icon:SetHeight(ICON)
+		btn.Icon:SetWidth(DASH - 4)
+		btn.Icon:SetHeight(DASH - 4)
+		btn.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
+
+		btn.cTL = btn:CreateFontString(nil, "OVERLAY")
+		btn.cTL:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
+		btn.cTL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn.cTR = btn:CreateFontString(nil, "OVERLAY")
+		btn.cTR:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -1, -1)
+		btn.cTR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn.cBL = btn:CreateFontString(nil, "OVERLAY")
+		btn.cBL:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 1)
+		btn.cBL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn.cBR = btn:CreateFontString(nil, "OVERLAY")
+		btn.cBR:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
+		btn.cBR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		return btn
+	end
+	MP.Work.DashIcons.MH = createDash("MH")
+	MP.Work.DashIcons.OH = createDash("OH")
+
+	local function createListItem(t)
+		local btn = CreateFrame("Button", nil, frame)
+		btn.typeId = t
+		btn:SetWidth(LICON)
+		btn:SetHeight(LICON)
+		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+		btn:SetScript("OnClick", function()
+			local b = tostring(arg1 or "")
+			if b == "RightButton" or b == "RightButtonUp" then
+				MP.Work.ListMode = nil
+				MP:Layout()
+			elseif IsShiftKeyDown() then
+				MP:Apply(t, "OH")
+			else
+				MP:Apply(t, "MH")
+			end
+		end)
+		btn:SetScript("OnEnter", function()
+			MP:ShowTooltip(btn, t, "左键 涂主手 | Shift+左键 涂副手 | 右键 收起")
+		end)
+		btn:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+		if btn.SetHighlightTexture then
+			btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+		end
+
+		btn.Icon = btn:CreateTexture(nil, "ARTWORK")
+		btn.Icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
+		btn.Icon:SetWidth(LICON)
+		btn.Icon:SetHeight(LICON)
 		btn.Icon:SetTexture(MP.Types[t].icon)
-
-		btn.bMH = btn:CreateFontString(nil, "OVERLAY")
-		btn.bMH:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
-		btn.bMH:SetFont("Fonts\\ARIALN.TTF", 10, "OUTLINE")
-
-		btn.bOH = btn:CreateFontString(nil, "OVERLAY")
-		btn.bOH:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -1, -1)
-		btn.bOH:SetFont("Fonts\\ARIALN.TTF", 10, "OUTLINE")
 
 		btn.bStock = btn:CreateFontString(nil, "OVERLAY")
 		btn.bStock:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
 		btn.bStock:SetFont("Fonts\\ARIALN.TTF", 10, "OUTLINE")
 		btn.bStock:SetTextColor(1, 1, 1)
 
+		btn:Hide()
 		return btn
 	end
-
 	for _, t in ipairs(MP.Work.UsableOrder) do
-		MP.Work.Icons[t] = createIcon(frame, t)
+		MP.Work.ListIcons[t] = createListItem(t)
 	end
-
-	-- 抽屉开关
-	local chev = CreateFrame("Button", nil, frame)
-	frame.Chev = chev
-	chev:SetWidth(16)
-	chev:SetHeight(16)
-	if chev.SetHighlightTexture then
-		chev:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
-	end
-	chev:SetScript("OnClick", function()
-		MPcfg.DrawerOpen = (MPcfg.DrawerOpen == 1) and 0 or 1
-		MP:Layout()
-	end)
-	chev:SetScript("OnEnter", function()
-		GameTooltip:SetOwner(chev, "ANCHOR_RIGHT")
-		GameTooltip:AddLine("展开/收起抽屉 (隐藏的种类)", 1, 1, 1)
-		GameTooltip:Show()
-	end)
-	chev:SetScript("OnLeave", function()
-		GameTooltip:Hide()
-	end)
 
 	frame:SetScale(MPcfg.Scale or 1)
 	frame:ClearAllPoints()
@@ -670,11 +854,12 @@ function MP:ApplyLockPosition()
 		frame:SetScript("OnDragStop", frame.StopMove)
 	end
 	-- 面板可穿透, 但图标按钮始终可交互
+	local function keepMouse(btn) if btn then btn:EnableMouse(true) end end
+	keepMouse(MP.Work.DashIcons.MH)
+	keepMouse(MP.Work.DashIcons.OH)
 	for _, t in ipairs(MP.Work.UsableOrder) do
-		local btn = MP.Work.Icons[t]
-		if btn then btn:EnableMouse(true) end
+		keepMouse(MP.Work.ListIcons[t])
 	end
-	if frame.Chev then frame.Chev:EnableMouse(true) end
 end
 
 function MP:ApplyScale(newScale)
@@ -717,11 +902,15 @@ local skinConfigBootstrapped
 
 local function skinAllIcons()
 	if not (IsAddOnLoaded("pfUI") and pfUI and pfUI.api and pfUI.api.SkinButton) then return end
-	for _, t in ipairs(MP.Work.UsableOrder) do
-		local btn = MP.Work.Icons[t]
+	local function skin(btn)
 		if btn then
 			pcall(function() pfUI.api.SkinButton(btn, nil, nil, nil, btn.Icon) end)
 		end
+	end
+	skin(MP.Work.DashIcons.MH)
+	skin(MP.Work.DashIcons.OH)
+	for _, t in ipairs(MP.Work.UsableOrder) do
+		skin(MP.Work.ListIcons[t])
 	end
 end
 
@@ -839,7 +1028,7 @@ function MP:ConfigFubar()
 				timeWarn = {
 					type = 'range',
 					name = "时间红字阈值(分钟)",
-					desc = "附魔剩余时间低于该值时角标切换为时间并标红",
+					desc = "附魔剩余时间低于该值时时间角标变红",
 					min = 1, max = 15, step = 1,
 					get = function() return MPcfg.TimeWarn or 5 end,
 					set = function(value) MPcfg.TimeWarn = value end,
@@ -881,7 +1070,7 @@ function MP:OnEvent()
 		initConfig()
 		buildNameIndex()
 		MP.loaded = 1
-		logMsg("v0.1.0 已加载, 等待初始化...")
+		logMsg("v0.2.0 已加载, 等待初始化...")
 	elseif event == "SPELLCAST_START" then
 		MP.Work.iSCasting = 1
 	elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_INTERRUPTED" or event == "SPELLCAST_FAILED" then
@@ -999,9 +1188,9 @@ local function mpSlash(arg1)
 	elseif string.sub(arg1, 1, 5) == "reset" then
 		MP:ResetPosition()
 	elseif arg1 == "" then
-		if MP.ConfigFrame:IsVisible() then
+		if MP.ConfigFrame and MP.ConfigFrame:IsVisible() then
 			MP.ConfigFrame:Hide()
-		else
+		elseif MP.ConfigFrame then
 			MP:Refresh(); MP.ConfigFrame:Show()
 		end
 	else
