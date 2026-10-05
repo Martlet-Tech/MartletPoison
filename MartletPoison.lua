@@ -1,6 +1,7 @@
--- MartletPoison 0.2.0 看板版
+-- MartletPoison 0.3.0 看板版
 -- 所见即所涂的涂毒助手。基于 EzPoison (Sunelegy/qyj) 的成熟逻辑改造。
--- 双看板(主手/副手) + 四角信息(次数/时间/等级/库存) + 有货/全量列表。
+-- 双看板(主手/副手) + 四角信息(次数/时间/等级/库存) + 有货/全量列表(向上弹出)。
+-- 双语: 物品匹配中文/英文客户端通用 (背包按物品ID匹配, 武器按双语名匹配)。
 -- 面板显示武器状态而非背包库存; 点击=涂抹; 无影响行为的隐藏状态。
 
 -- 命名空间: 本客户端环境已预置全局 MP(字符串), 必须用插件全名并做类型防护
@@ -11,23 +12,23 @@ MP.api = getfenv()
 MP.INF_CHAR = "∞" -- 时间型无次数概念; 若客户端字形缺失, 改成 "--"
 
 -- ==================== 数据表 ====================
--- 种类定义 (id 与 EzPoison 保持一致, 便于对照)
+-- 种类定义 (id 与 EzPoison 保持一致, 便于对照); nameEN 供国际服客户端匹配
 MP.Types = {
-	[1]  = { name = "速效毒药",     icon = "Interface\\Icons\\Ability_Poisons" },
-	[2]  = { name = "致命毒药",     icon = "Interface\\Icons\\Ability_Rogue_DualWeild" },
-	[3]  = { name = "致残毒药",     icon = "Interface\\Icons\\INV_Potion_19" },
-	[4]  = { name = "致伤毒药",     icon = "Interface\\Icons\\Ability_PoisonSting" },
-	[5]  = { name = "腐蚀毒药",     icon = "Interface\\Icons\\inv_corrosive_01" },
-	[6]  = { name = "麻痹毒药",     icon = "Interface\\Icons\\Spell_Nature_NullifyDisease" },
-	[7]  = { name = "煽动毒药",     icon = "Interface\\Icons\\Spell_Nature_NullifyPoison" },
-	[8]  = { name = "溶解毒药",     icon = "Interface\\Icons\\Spell_Nature_SlowPoison" },
-	[9]  = { name = "致密磨刀石",   icon = "Interface\\Icons\\inv_stone_sharpeningstone_05" },
-	[10] = { name = "致密平衡石",   icon = "Interface\\Icons\\INV_Stone_WeightStone_05" },
-	[11] = { name = "元素磨刀石",   icon = "Interface\\Icons\\inv_stone_02" },
-	[12] = { name = "神圣磨刀石",   icon = "Interface\\Icons\\INV_Stone_SharpeningStone_02" },
-	[13] = { name = "卓越巫师之油", icon = "Interface\\Icons\\INV_Potion_105" },
-	[14] = { name = "卓越法力之油", icon = "Interface\\Icons\\INV_Potion_100" },
-	[15] = { name = "神圣巫师之油", icon = "Interface\\Icons\\INV_POTION_26" },
+	[1]  = { name = "速效毒药",     nameEN = "Instant Poison",            icon = "Interface\\Icons\\Ability_Poisons" },
+	[2]  = { name = "致命毒药",     nameEN = "Deadly Poison",             icon = "Interface\\Icons\\Ability_Rogue_DualWeild" },
+	[3]  = { name = "致残毒药",     nameEN = "Crippling Poison",          icon = "Interface\\Icons\\INV_Potion_19" },
+	[4]  = { name = "致伤毒药",     nameEN = "Wound Poison",               icon = "Interface\\Icons\\Ability_PoisonSting" },
+	[5]  = { name = "腐蚀毒药",     nameEN = "Corrosive Poison",           icon = "Interface\\Icons\\inv_corrosive_01" },
+	[6]  = { name = "麻痹毒药",     nameEN = "Mind-numbing Poison",        icon = "Interface\\Icons\\Spell_Nature_NullifyDisease" },
+	[7]  = { name = "煽动毒药",     nameEN = "Incite",                     icon = "Interface\\Icons\\Spell_Nature_NullifyPoison" },
+	[8]  = { name = "溶解毒药",     nameEN = "Dissolvent",                 icon = "Interface\\Icons\\Spell_Nature_SlowPoison" },
+	[9]  = { name = "致密磨刀石",   nameEN = "Dense Sharpening Stone",     icon = "Interface\\Icons\\inv_stone_sharpeningstone_05" },
+	[10] = { name = "致密平衡石",   nameEN = "Dense Weightstone",          icon = "Interface\\Icons\\INV_Stone_WeightStone_05" },
+	[11] = { name = "元素磨刀石",   nameEN = "Elemental Sharpening Stone", icon = "Interface\\Icons\\inv_stone_02" },
+	[12] = { name = "神圣磨刀石",   nameEN = "Holy Sharpening Stone",      icon = "Interface\\Icons\\INV_Stone_SharpeningStone_02" },
+	[13] = { name = "卓越巫师之油", nameEN = "Brilliant Wizard Oil",       icon = "Interface\\Icons\\INV_Potion_105" },
+	[14] = { name = "卓越法力之油", nameEN = "Brilliant Mana Oil",         icon = "Interface\\Icons\\INV_Potion_100" },
+	[15] = { name = "神圣巫师之油", nameEN = "Holy Wizard Oil",            icon = "Interface\\Icons\\INV_POTION_26" },
 }
 
 -- 各等级物品: { 后缀, 物品ID }, 从高到低 (移植自 EzPoison.GetInventoryID 的硬编码)
@@ -53,15 +54,13 @@ MP.RANKS = {
 local ORDER_INDEX = { [1]=1, [2]=2, [4]=3, [3]=4, [6]=5, [5]=6, [8]=7, [7]=8,
 	[9]=9, [12]=10, [11]=11, [10]=12, [13]=13, [14]=14, [15]=15 }
 
--- 武器附魔行文字特征 (名称匹配不到的种类, 移植自 EzPoison.checkNotPoisonActiveSettings)
+-- 武器附魔行额外文字特征 (物品名匹配不到时的候选, 移植自 EzPoison.checkNotPoisonActiveSettings)
 MP.SIGNS = {
-	[9]  = "磨快",
-	[10] = "增重",
-	[11] = "致命一击",
-	[12] = "攻击强度vs亡灵",
-	[13] = "卓越巫师之油",
-	[14] = "卓越法力之油",
-	[15] = "法术伤害vs亡灵",
+	[9]  = { "磨快" },
+	[10] = { "增重" },
+	[11] = { "致命一击" },
+	[12] = { "攻击强度vs亡灵", "attack power vs undead" },
+	[15] = { "法术伤害vs亡灵", "spell damage vs undead" },
 }
 
 -- 职业过滤 (移植自 EzPoison.vPlayerClass)
@@ -111,7 +110,7 @@ MP.Work = {
 	activeOH = nil, rankOH = nil,
 	counts = {},        -- 背包各种类总数
 	rankCounts = {},    -- 背包各等级数量 [type][rankIdx]
-	NAME2ENTRY = {},    -- 小写物品名 -> {t=种类, r=等级序号}
+	ID2ENTRY = {},      -- 物品ID -> {t=种类, r=等级序号} (语言无关匹配)
 	UsableOrder = {},   -- 排序后的可用种类列表
 	ListMode = nil,     -- nil/"stock"/"all" (会话态, 不存档)
 	DashIcons = {},     -- ["MH"/"OH"] = 看板按钮
@@ -122,16 +121,45 @@ MP.Work = {
 	SkinApplied = nil,
 }
 
+MP.MatchCands = {}   -- [type] = { 双语名称+特征候选 } (武器行匹配用)
+
 local function logMsg(text)
 	DEFAULT_CHAT_FRAME:AddMessage("MartletPoison: " .. "|cFFFFFFFF" .. text .. "|r", 0.4, 0.8, 0.4)
 end
 
--- 名字索引 (一次性构建)
-local function buildNameIndex()
+-- 双语: 按客户端语言取文案 (UnitClass 首返回值是本地化职业名, 藉此判断语言)
+local function L(cn, en)
+	if MP.isCN == nil then
+		local ok, locName = pcall(UnitClass, "player")
+		if ok and locName then
+			MP.isCN = (string.byte(locName) > 127)
+		else
+			return cn -- 玩家数据未就绪, 默认中文
+		end
+	end
+	if MP.isCN then return cn else return en end
+end
+
+-- 名字候选 (双语武器行匹配用, 一次性构建)
+local function buildNameCands()
+	for t = 1, 15 do
+		local cands = {}
+		local norm = function(s) return (gsub(string.lower(s), "-", "")) end
+		table.insert(cands, norm(MP.Types[t].name))
+		table.insert(cands, norm(MP.Types[t].nameEN))
+		local signs = MP.SIGNS[t]
+		if signs then
+			for _, s in ipairs(signs) do table.insert(cands, norm(s)) end
+		end
+		MP.MatchCands[t] = cands
+	end
+end
+
+-- 物品ID索引 (一次性构建)
+local function buildIdIndex()
 	for t, ranks in pairs(MP.RANKS) do
-		local base = MP.Types[t].name
 		for r = 1, table.getn(ranks) do
-			MP.Work.NAME2ENTRY[string.lower(base .. ranks[r][1])] = { t = t, r = r }
+			MP.Work.ID2ENTRY[ranks[r][2]] = { t = t, r = r }
 		end
 	end
 end
@@ -178,8 +206,9 @@ function MP:BagScan()
 			if GetContainerItemInfo(i, j) then
 				local link = GetContainerItemLink(i, j)
 				if link then
-					local nm = string.lower(gsub(link, "^.*%[(.*)%].*$", "%1"))
-					local e = MP.Work.NAME2ENTRY[nm]
+					-- 按物品ID匹配, 与客户端语言无关
+					local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+					local e = idStr and MP.Work.ID2ENTRY[tonumber(idStr)]
 					if e then
 						local _, c = GetContainerItemInfo(i, j)
 						if c and c < 0 then c = c * -1 end
@@ -195,23 +224,22 @@ function MP:BagScan()
 	MP.Work.rankCounts = rankCounts
 end
 
--- 找背包里该种类最高等级的一瓶, 返回 bag, slot, itemId
+-- 找背包里该种类最高等级的一瓶, 返回 bag, slot, itemId (按物品ID匹配)
 function MP:FindItem(typeId, skipTopRank)
 	local ranks = MP.RANKS[typeId]
 	if not ranks then return nil end
-	local base = MP.Types[typeId].name
 	for r = 1, table.getn(ranks) do
 		if not (skipTopRank and r == 1) then
-			local want = string.lower(base .. ranks[r][1])
+			local wantId = ranks[r][2]
 			for i = 0, 4 do
 				local n = GetContainerNumSlots(i)
 				for j = 1, n do
 					if GetContainerItemInfo(i, j) then
 						local link = GetContainerItemLink(i, j)
 						if link then
-							local nm = string.lower(gsub(link, "^.*%[(.*)%].*$", "%1"))
-							if nm == want then
-								return i, j, ranks[r][2]
+							local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+							if idStr and tonumber(idStr) == wantId then
+								return i, j, wantId
 							end
 						end
 					end
@@ -223,7 +251,7 @@ function MP:FindItem(typeId, skipTopRank)
 end
 
 -- ==================== 武器附魔状态 ====================
--- 解析武器 tooltip, 返回 种类id, 等级序号 (等级来自行内后缀, 高等级优先避免 II/III 子串误匹配)
+-- 解析武器 tooltip, 返回 种类id, 等级序号 (双语名匹配; 等级来自行内后缀, 高等级优先避免 II/III 子串误匹配)
 function MP:ScanHand(slot)
 	local parser = MP.Parser
 	parser:SetOwner(UIParent, "ANCHOR_NONE")
@@ -240,13 +268,22 @@ function MP:ScanHand(slot)
 			if line then
 				local lowerText = gsub(string.lower(line), "-", "")
 				for _, t in ipairs(MP.Work.UsableOrder) do
-					local sign = MP.SIGNS[t] or MP.Types[t].name
-					if string.find(lowerText, gsub(string.lower(sign), "-", ""), 1, true) then
+					local cands = MP.MatchCands[t]
+					local hit = nil
+					for _, c in ipairs(cands) do
+						if string.find(lowerText, c, 1, true) then
+							hit = c
+							break
+						end
+					end
+					if hit then
+						-- 等级: 双语 "名称+后缀" 从高到低匹配
 						local rank = table.getn(MP.RANKS[t]) -- 无后缀 = 基础等级(列表末位)
 						for r = 1, table.getn(MP.RANKS[t]) do
 							if MP.RANKS[t][r][1] ~= "" then
-								local full = gsub(string.lower(MP.Types[t].name .. MP.RANKS[t][r][1]), "-", "")
-								if string.find(lowerText, full, 1, true) then
+								local suffixCN = gsub(string.lower(MP.Types[t].name .. MP.RANKS[t][r][1]), "-", "")
+								local suffixEN = gsub(string.lower(MP.Types[t].nameEN .. MP.RANKS[t][r][1]), "-", "")
+								if string.find(lowerText, suffixCN, 1, true) or string.find(lowerText, suffixEN, 1, true) then
 									rank = r
 									break
 								end
@@ -488,7 +525,7 @@ function MP:Apply(typeId, hand)
 	if not typeId or MP.Work.iSCasting then return end
 
 	if hand == "OH" and not GetInventoryItemTexture("player", 17) then
-		logMsg("未装备副手。")
+		logMsg(L("未装备副手。", "No offhand weapon equipped."))
 		return
 	end
 
@@ -504,7 +541,8 @@ function MP:Apply(typeId, hand)
 	local bag, slot = MP:FindItem(typeId, skipTop)
 	if not bag then
 		local who = hand == "MH" and "MainHand" or "OffHand"
-		logMsg("|cFFCC9900" .. who .. "|r |cFFFFFFFF未发现" .. MP.Types[typeId].name .. "。|r")
+		local nm = L(MP.Types[typeId].name, MP.Types[typeId].nameEN)
+		logMsg("|cFFCC9900" .. who .. "|r |cFFFFFFFF" .. L("未发现" .. nm .. "。", "No " .. nm .. " found.") .. "|r")
 		return
 	end
 
@@ -534,7 +572,7 @@ function MP:Reapply(hand)
 	local last
 	if hand == "MH" then last = MPcfg.LastMH or 0 else last = MPcfg.LastOH or 0 end
 	if last == 0 then
-		logMsg(hand == "MH" and "主手还没涂过毒" or "副手还没涂过毒")
+		logMsg(L("还没涂过毒", "Never applied yet"))
 		return
 	end
 	local active
@@ -548,7 +586,8 @@ function MP:Reapply(hand)
 			exp, chg = si[5], si[6]
 		end
 		if marginPct(last, exp, chg) > 0.25 then
-			logMsg(MP.Types[last].name .. " 余量还充足, 不重涂 (橙/红时才会补)")
+			local nm = L(MP.Types[last].name, MP.Types[last].nameEN)
+			logMsg(L(nm .. " 余量还充足, 不重涂 (橙/红时才会补)", nm .. " still has plenty left, not reapplying (applies at orange/red)"))
 			return
 		end
 	end
@@ -585,16 +624,25 @@ end
 function MP:Layout()
 	local frame = MP.ConfigFrame
 	if not frame then return end
+	if frame._dragging then return end -- 拖动中不动它
 	local dashMH = MP.Work.DashIcons.MH
 	local dashOH = MP.Work.DashIcons.OH
 	if not dashMH or not dashOH then return end
 
-	dashMH:ClearAllPoints()
-	dashMH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD, -PAD)
-	dashOH:ClearAllPoints()
-	dashOH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + DASH + GAP, -PAD)
-
 	local mode = MP.Work.ListMode
+	local rowOffset = 0
+	if mode then rowOffset = STEP + GAP end
+
+	-- 列表在看板上方弹出: 展开时整体锚点上移一行, 使看板在屏幕上保持原位
+	local scale = frame:GetScale() or (MPcfg.Scale or 1)
+	frame:ClearAllPoints()
+	frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", (MPcfg.PosX or screenCenterX) / scale, ((MPcfg.PosY or -screenCenterY) + rowOffset) / scale)
+
+	dashMH:ClearAllPoints()
+	dashMH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD, -(PAD + rowOffset))
+	dashOH:ClearAllPoints()
+	dashOH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + DASH + GAP, -(PAD + rowOffset))
+
 	local listW = 0
 	if mode then
 		local x = PAD
@@ -603,7 +651,7 @@ function MP:Layout()
 			local show = (mode == "all") or ((MP.Work.counts[t] or 0) > 0)
 			if show then
 				item:ClearAllPoints()
-				item:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -(PAD + DASH + GAP))
+				item:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -PAD)
 				item:Show()
 				x = x + STEP
 			else
@@ -621,8 +669,7 @@ function MP:Layout()
 
 	local groupW = PAD + DASH + GAP + DASH + PAD
 	local width = groupW > listW and groupW or listW
-	local height = PAD + DASH + PAD
-	if mode then height = PAD + DASH + GAP + STEP + PAD end
+	local height = PAD + rowOffset + DASH + PAD
 	frame:SetWidth(width)
 	frame:SetHeight(height)
 
@@ -650,7 +697,7 @@ function MP:ShowTooltip(btn, typeId, hint)
 		end
 	end
 	if not any then
-		GameTooltip:AddLine("背包没有", 0.6, 0.6, 0.6)
+		GameTooltip:AddLine(L("背包没有", "None in bags"), 0.6, 0.6, 0.6)
 	end
 
 	-- 两手状态 (含等级)
@@ -661,9 +708,9 @@ function MP:ShowTooltip(btn, typeId, hint)
 			rankT = gsub(suf, " ", "")
 			if rankT == "" then rankT = "-" end
 		end
-		GameTooltip:AddLine("主手: 已涂 " .. rankT .. " · 剩 " .. MP:RemainText(typeId, "MH"), 0.4, 0.8, 0.4)
+		GameTooltip:AddLine(L("主手: 已涂 ", "MH: applied ") .. rankT .. L(" · 剩 ", " · ") .. MP:RemainText(typeId, "MH"), 0.4, 0.8, 0.4)
 	elseif (MPcfg.LastMH or 0) == typeId then
-		GameTooltip:AddLine("主手: 已用尽 (上次涂的)", 1, 0, 0)
+		GameTooltip:AddLine(L("主手: 已用尽 (上次涂的)", "MH: depleted (last applied)"), 1, 0, 0)
 	end
 	if MP.Work.slotInfo[4] and MP.Work.activeOH == typeId then
 		local rankT = "-"
@@ -672,9 +719,9 @@ function MP:ShowTooltip(btn, typeId, hint)
 			rankT = gsub(suf, " ", "")
 			if rankT == "" then rankT = "-" end
 		end
-		GameTooltip:AddLine("副手: 已涂 " .. rankT .. " · 剩 " .. MP:RemainText(typeId, "OH"), 0.4, 0.8, 0.4)
+		GameTooltip:AddLine(L("副手: 已涂 ", "OH: applied ") .. rankT .. L(" · 剩 ", " · ") .. MP:RemainText(typeId, "OH"), 0.4, 0.8, 0.4)
 	elseif (MPcfg.LastOH or 0) == typeId then
-		GameTooltip:AddLine("副手: 已用尽 (上次涂的)", 1, 0, 0)
+		GameTooltip:AddLine(L("副手: 已用尽 (上次涂的)", "OH: depleted (last applied)"), 1, 0, 0)
 	end
 
 	if hint then
@@ -690,14 +737,19 @@ function MP:ConfigureUI()
 	local frame = MP.ConfigFrame
 
 	function frame:StartMove()
+		this._dragging = 1
 		this:StartMoving()
 	end
 	function frame:StopMove()
+		this._dragging = nil
 		this:StopMovingOrSizing()
 		local a, _, b, x, y = frame:GetPoint()
 		local currentScale = frame:GetScale() or (MPcfg.Scale or 1)
+		-- 保存基准位置 (扣除展开时锚点上移的偏移)
+		local rowOffset = 0
+		if MP.Work.ListMode then rowOffset = STEP + GAP end
 		MPcfg.PosX = x * currentScale
-		MPcfg.PosY = y * currentScale
+		MPcfg.PosY = (y - rowOffset) * currentScale
 	end
 
 	local backdrop = {
@@ -739,10 +791,10 @@ function MP:ConfigureUI()
 		end)
 		btn:SetScript("OnEnter", function()
 			if btn.typeId then
-				MP:ShowTooltip(btn, btn.typeId, "左键 补涂 | 右键 有货列表 | Shift+右键 全部")
+				MP:ShowTooltip(btn, btn.typeId, L("左键 补涂 | 右键 有货列表 | Shift+右键 全部", "L: reapply | R: stocked list | Shift+R: all"))
 			else
 				GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
-				GameTooltip:AddLine("空槽 - 先从列表涂一次毒", 0.8, 0.8, 0.8)
+				GameTooltip:AddLine(L("空槽 - 先从列表涂一次毒", "Empty - pick a poison from the list first"), 0.8, 0.8, 0.8)
 				GameTooltip:Show()
 			end
 		end)
@@ -797,7 +849,7 @@ function MP:ConfigureUI()
 			end
 		end)
 		btn:SetScript("OnEnter", function()
-			MP:ShowTooltip(btn, t, "左键 涂主手 | 右键/Shift+左键 涂副手")
+			MP:ShowTooltip(btn, t, L("左键 涂主手 | 右键/Shift+左键 涂副手", "L: main hand | R/Shift+L: off hand"))
 		end)
 		btn:SetScript("OnLeave", function()
 			GameTooltip:Hide()
@@ -889,7 +941,7 @@ function MP:ResetPosition()
 		frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", screenCenterX, -screenCenterY)
 		if not frame:IsVisible() then frame:Show() end
 	end
-	logMsg("窗口位置已重置")
+	logMsg(L("窗口位置已重置", "Position reset"))
 end
 
 -- ==================== pfUI 皮肤 (移植自 EzPoison, 含时序兼容) ====================
@@ -1067,9 +1119,10 @@ function MP:OnEvent()
 		end
 	elseif event == "ADDON_LOADED" and arg1 == "MartletPoison" then
 		initConfig()
-		buildNameIndex()
+		buildIdIndex()
+		buildNameCands()
 		MP.loaded = 1
-		logMsg("v0.2.0 已加载, 等待初始化...")
+		logMsg(L("v0.3.0 已加载, 等待初始化...", "v0.3.0 loaded, waiting for init..."))
 	elseif event == "SPELLCAST_START" then
 		MP.Work.iSCasting = 1
 	elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_INTERRUPTED" or event == "SPELLCAST_FAILED" then
@@ -1145,7 +1198,7 @@ classCheckFrame:SetScript("OnUpdate", function()
 			MP.Work.dirty = 1
 		end)
 		if ok then
-			logMsg("面板初始化完成, /mpoison 开关")
+			logMsg(L("面板初始化完成, /mpoison 开关", "Panel ready, /mpoison to toggle"))
 		else
 			DEFAULT_CHAT_FRAME:AddMessage("MartletPoison 初始化失败: " .. tostring(err), 1, 0, 0)
 		end
@@ -1163,26 +1216,26 @@ local function mpSlash(arg1)
 	elseif string.sub(arg1, 1, 4) == "lock" then
 		MPcfg.LockPosition = 1
 		MP:ApplyLockPosition()
-		logMsg("窗口位置已锁定")
+		logMsg(L("窗口位置已锁定", "Position locked"))
 	elseif string.sub(arg1, 1, 6) == "unlock" then
 		MPcfg.LockPosition = 0
 		MP:ApplyLockPosition()
-		logMsg("窗口位置已解锁")
+		logMsg(L("窗口位置已解锁", "Position unlocked"))
 	elseif string.sub(arg1, 1, 3) == "pos" then
 		local _, _, x, y = string.find(arg1, "^pos%s+([%-%d]+)[, ]([%-%d]+)")
 		if x and y then
 			MPcfg.PosX = tonumber(x)
 			MPcfg.PosY = -tonumber(y)
 			MP:ApplyPosition()
-			logMsg("窗口位置已设置为 (" .. x .. ", " .. y .. ")")
+			logMsg(L("窗口位置已设置为 (" .. x .. ", " .. y .. ")", "Position set to (" .. x .. ", " .. y .. ")"))
 		else
-			logMsg("|cFFFF0000命令参数错误 (例: /mpoison pos 100,100)|r")
+			logMsg("|cFFFF0000" .. L("命令参数错误 (例: /mpoison pos 100,100)", "Bad args (e.g. /mpoison pos 100,100)") .. "|r")
 		end
 	elseif string.sub(arg1, 1, 5) == "time " then
 		local n = tonumber(string.sub(arg1, 6, string.len(arg1)))
 		if n and n >= 1 and n <= 15 then
 			MPcfg.TimeWarn = n
-			logMsg("时间红字阈值: " .. n .. " 分钟")
+			logMsg(L("时间红字阈值: " .. n .. " 分钟", "Time red threshold: " .. n .. " min"))
 		end
 	elseif string.sub(arg1, 1, 5) == "reset" then
 		MP:ResetPosition()
@@ -1193,7 +1246,7 @@ local function mpSlash(arg1)
 			MP:Refresh(); MP.ConfigFrame:Show()
 		end
 	else
-		logMsg("命令: /mpoison 开关面板 | scale N | lock | unlock | pos x,y | time N | reset")
+		logMsg(L("命令: /mpoison 开关面板 | scale N | lock | unlock | pos x,y | time N | reset", "Usage: /mpoison toggle | scale N | lock | unlock | pos x,y | time N | reset"))
 	end
 end
 
