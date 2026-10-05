@@ -789,8 +789,7 @@ function MP:ConfigureUI()
 		btn:SetScript("OnClick", function()
 			local b = tostring(arg1 or "")
 			if b == "RightButton" or b == "RightButtonUp" then
-				MP.Work.ListMode = nil
-				MP:Layout()
+				MP:Apply(t, "OH")
 			elseif IsShiftKeyDown() then
 				MP:Apply(t, "OH")
 			else
@@ -798,7 +797,7 @@ function MP:ConfigureUI()
 			end
 		end)
 		btn:SetScript("OnEnter", function()
-			MP:ShowTooltip(btn, t, "左键 涂主手 | Shift+左键 涂副手 | 右键 收起")
+			MP:ShowTooltip(btn, t, "左键 涂主手 | 右键/Shift+左键 涂副手")
 		end)
 		btn:SetScript("OnLeave", function()
 			GameTooltip:Hide()
