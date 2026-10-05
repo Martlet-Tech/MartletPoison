@@ -2,13 +2,11 @@
 
 Turtle WoW（1.18.1）盗贼涂毒助手。全新独立插件，**不改动 EzPoison 任何文件**。
 
-## 开发与部署
+## 截图
 
-本仓库是源代码真身，游戏目录下的 `Interface\AddOns\MartletPoison` 只是部署产物。
+![看板与tooltip](screenshots/dashboard-tooltip.png)
 
-- 改代码 → 在仓库里改
-- 部署 → 双击 `deploy.bat`，游戏内小退重登生效
-- 客户端兼容注意：Lua 5.0 系老客户端，且有改版客户端特有的坑——全局 `MP` 被预置占用（命名空间用全名+类型防护）、for 循环控制变量在循环结束后的闭包里读到 nil（一切闭包用工厂函数传参）、`RegisterForClicks` 用显式键名不用 `AnyUp`
+![有货列表](screenshots/stock-list.png)
 
 ## 核心原则
 
