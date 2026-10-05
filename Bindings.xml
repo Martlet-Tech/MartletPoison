@@ -1,0 +1,3 @@
+<Bindings>
+	<Binding name="MPTOGGLE" header="MPHEADER"> MartletPoisonToggle() </Binding>
+</Bindings>

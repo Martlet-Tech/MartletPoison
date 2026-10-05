@@ -1,0 +1,11 @@
+## Interface: 11200
+## Title: MartletPoison |cff7fff7f-v0.1.0|r
+## Author: Martlet
+## Notes: 所见即所涂的涂毒助手 (Turtle WoW)
+## Title-zhCN: |cffFF4500[职业]|r[|Cfffff569盗贼|R] Martlet毒药助手
+## Notes-zhCN: 图标即毒药：左键主手/右键副手/中键藏放，角标显示余量与库存。
+## SavedVariablesPerCharacter: MPcfg
+## DefaultState: Enabled
+## Version: 0.1.0
+
+MartletPoison.lua

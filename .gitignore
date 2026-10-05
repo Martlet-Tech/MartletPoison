@@ -1,0 +1,9 @@
+# Windows 垃圾
+Thumbs.db
+Desktop.ini
+
+# 编辑器
+*.swp
+*~
+.vscode/
+.idea/
