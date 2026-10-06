@@ -806,14 +806,7 @@ function MP:ConfigureUI()
 		MPcfg.PosY = (y - rowOffset) * currentScale
 	end
 
-	-- 主框只做拖动与黑底; 边框由看板/列表各自的独立框承担
-	local backdrop = {
-		bgFile = "Interface\\TutorialFrame\\TutorialFrameBackground",
-		tile = true, tileSize = 16,
-		insets = { left = 3, right = 5, top = 3, bottom = 5 }
-	}
-	frame:SetBackdrop(backdrop)
-	frame:SetBackdropColor(0, 0, 0, 0.8)
+	-- 主框只做拖动载体, 不可见; 黑底+边框由看板/列表各自的独立框承担 (底随边框走, 不露多余黑边)
 	frame:SetMovable(true)
 	frame:EnableMouse(true)
 	frame:RegisterForDrag("LeftButton")
@@ -824,14 +817,16 @@ function MP:ConfigureUI()
 
 	buildUsableOrder()
 
-	-- 独立边框框体: 看板 (颜色随两手余量较差侧) / 列表 (恒白, 不做警示)
+	-- 独立边框框体: 看板 (颜色随两手余量较差侧) / 列表 (恒白, 不做警示); 各自带黑底
 	local function createBorder()
 		local bf = CreateFrame("Frame", nil, frame)
 		bf:SetBackdrop({
+			bgFile = "Interface\\TutorialFrame\\TutorialFrameBackground",
 			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-			tile = false, edgeSize = 16,
+			tile = true, tileSize = 16, edgeSize = 16,
 			insets = { left = 3, right = 5, top = 3, bottom = 5 }
 		})
+		bf:SetBackdropColor(0, 0, 0, 0.8)
 		bf:EnableMouse(false) -- 不挡点击
 		return bf
 	end
@@ -1070,7 +1065,7 @@ local function registerSkin()
 			skinChatOnce = true
 			DEFAULT_CHAT_FRAME:AddMessage("MartletPoison: " .. "|cFFFFFFFF" .. "pfUI skin applied." .. "|r", 0.4, 0.8, 0.4)
 		end
-		-- 边框由看板/列表两个独立框承担 (主框只有黑底), 边色随后由 Layout 覆写
+		-- 黑底+边框由看板/列表两个独立框承担 (主框不可见), 边色随后由 Layout 覆写
 		local function skinBorder(bf)
 			if not bf then return end
 			pfUI.api.StripTextures(bf, true)
@@ -1079,9 +1074,6 @@ local function registerSkin()
 		end
 		skinBorder(MP.Work.DashBorder)
 		skinBorder(MP.Work.ListBorder)
-		if MP.ConfigFrame and MP.ConfigFrame.SetBackdropColor then
-			pcall(function() MP.ConfigFrame:SetBackdropColor(0, 0, 0, 0.8) end)
-		end
 		pcall(function() MP:Layout() end) -- 皮肤覆写边色后立刻按状态刷回
 	end)
 
