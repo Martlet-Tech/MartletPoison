@@ -4,9 +4,17 @@ Turtle WoW（1.18.1）盗贼涂毒助手。全新独立插件，**不改动 EzPo
 
 ## 截图
 
+收起态看板 + 悬停 tooltip（看板边框随两手余量较差侧显色，此处两手充足 = 绿）：
+
 ![看板与tooltip](screenshots/dashboard-tooltip.png)
 
+有货列表（悬停显示各等级数量与两手状态）：
+
 ![有货列表](screenshots/stock-list.png)
+
+全量列表（毒药 + 磨刀石，无货的降透明度；列表边框恒白）：
+
+![全量列表](screenshots/full-list.png)
 
 ## 核心原则
 
