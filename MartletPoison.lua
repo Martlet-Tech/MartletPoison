@@ -316,7 +316,7 @@ local function fmtTime(ms)
 end
 
 local function pctColor(pct)
-	if pct <= 0 then return COLOR_RED end
+	if pct <= 0.1 then return COLOR_RED end
 	if pct <= 0.25 then return COLOR_ORANGE end
 	if pct <= 0.5 then return COLOR_YELLOW end
 	return COLOR_GREEN
@@ -338,6 +338,25 @@ local function marginPct(typeId, exp, chg)
 	elseif p1 then return p1
 	elseif p2 then return p2 end
 	return 1
+end
+
+-- 单手余量档位 (看板边框用): 未涂但有记忆 = 0 (红), 完全无记忆 = nil (中性)
+local function handPct(hand)
+	local si = MP.Work.slotInfo
+	local has, exp, chg, active, last
+	if hand == "MH" then
+		has, exp, chg = si[1], si[2], si[3]
+		active, last = MP.Work.activeMH, MPcfg.LastMH or 0
+	else
+		has, exp, chg = si[4], si[5], si[6]
+		active, last = MP.Work.activeOH, MPcfg.LastOH or 0
+	end
+	if has and active then
+		return marginPct(active, exp, chg)
+	elseif last ~= 0 then
+		return 0
+	end
+	return nil
 end
 
 -- ==================== 看板四角 ====================
@@ -610,8 +629,9 @@ local DASH = 40    -- 看板图标尺寸
 local LICON = 32   -- 列表图标尺寸
 local STEP = 36    -- 列表项步进
 local GAP = 6      -- 看板间距 / 行距
+local BMARGIN = 2  -- 独立边框外扩留白
 
--- 展开态绿色边框 (兼容 pfUI 的独立 backdrop)
+-- 边框颜色设置 (兼容 pfUI 的独立 backdrop)
 local function setGroupBorder(frame, r, g, b, a)
 	if frame.backdrop and frame.backdrop.SetBackdropBorderColor then
 		frame.backdrop:SetBackdropBorderColor(r, g, b, a)
@@ -643,7 +663,30 @@ function MP:Layout()
 	dashOH:ClearAllPoints()
 	dashOH:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + DASH + GAP, -(PAD + rowOffset))
 
+	-- 看板独立边框: 颜色 = 两手余量较差一侧的色阶 (都无记忆时白色)
+	local dashBorder = MP.Work.DashBorder
+	if dashBorder then
+		dashBorder:ClearAllPoints()
+		dashBorder:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD - BMARGIN, -(PAD + rowOffset - BMARGIN))
+		dashBorder:SetWidth(DASH + GAP + DASH + 2 * BMARGIN)
+		dashBorder:SetHeight(DASH + 2 * BMARGIN)
+		local p1, p2 = handPct("MH"), handPct("OH")
+		local p
+		if p1 and p2 then
+			if p1 < p2 then p = p1 else p = p2 end
+		elseif p1 then p = p1
+		elseif p2 then p = p2
+		end
+		if p then
+			local col = pctColor(p)
+			setGroupBorder(dashBorder, col[1], col[2], col[3], 1)
+		else
+			setGroupBorder(dashBorder, 1, 1, 1, 1)
+		end
+	end
+
 	local listW = 0
+	local listN = 0
 	if mode then
 		local x = PAD
 		for _, t in ipairs(MP.Work.UsableOrder) do
@@ -654,6 +697,7 @@ function MP:Layout()
 				item:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -PAD)
 				item:Show()
 				x = x + STEP
+				listN = listN + 1
 			else
 				item:Hide()
 			end
@@ -667,17 +711,27 @@ function MP:Layout()
 		end
 	end
 
+	-- 列表独立边框: 恒白, 不做色彩警示
+	local listBorder = MP.Work.ListBorder
+	if listBorder then
+		if mode and listN > 0 then
+			local rowW = (listN - 1) * STEP + LICON
+			listBorder:ClearAllPoints()
+			listBorder:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD - BMARGIN, -(PAD - BMARGIN))
+			listBorder:SetWidth(rowW + 2 * BMARGIN)
+			listBorder:SetHeight(LICON + 2 * BMARGIN)
+			setGroupBorder(listBorder, 1, 1, 1, 1)
+			listBorder:Show()
+		else
+			listBorder:Hide()
+		end
+	end
+
 	local groupW = PAD + DASH + GAP + DASH + PAD
 	local width = groupW > listW and groupW or listW
 	local height = PAD + rowOffset + DASH + PAD
 	frame:SetWidth(width)
 	frame:SetHeight(height)
-
-	if mode then
-		setGroupBorder(frame, 0, 1, 0, 1)
-	else
-		setGroupBorder(frame, 1, 1, 1, 1)
-	end
 end
 
 function MP:ShowTooltip(btn, typeId, hint)
@@ -752,10 +806,10 @@ function MP:ConfigureUI()
 		MPcfg.PosY = (y - rowOffset) * currentScale
 	end
 
+	-- 主框只做拖动与黑底; 边框由看板/列表各自的独立框承担
 	local backdrop = {
 		bgFile = "Interface\\TutorialFrame\\TutorialFrameBackground",
-		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-		tile = true, tileSize = 16, edgeSize = 16,
+		tile = true, tileSize = 16,
 		insets = { left = 3, right = 5, top = 3, bottom = 5 }
 	}
 	frame:SetBackdrop(backdrop)
@@ -769,6 +823,20 @@ function MP:ConfigureUI()
 	frame:SetScript("OnHide", function() MPcfg.isVisible = nil end)
 
 	buildUsableOrder()
+
+	-- 独立边框框体: 看板 (颜色随两手余量较差侧) / 列表 (恒白, 不做警示)
+	local function createBorder()
+		local bf = CreateFrame("Frame", nil, frame)
+		bf:SetBackdrop({
+			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+			tile = false, edgeSize = 16,
+			insets = { left = 3, right = 5, top = 3, bottom = 5 }
+		})
+		bf:EnableMouse(false) -- 不挡点击
+		return bf
+	end
+	MP.Work.DashBorder = createBorder()
+	MP.Work.ListBorder = createBorder()
 
 	-- 工厂函数: 迭代变量一律经参数传入 (本客户端 for 控制变量在循环后的闭包里读到 nil)
 	local function createDash(hand)
@@ -1002,9 +1070,19 @@ local function registerSkin()
 			skinChatOnce = true
 			DEFAULT_CHAT_FRAME:AddMessage("MartletPoison: " .. "|cFFFFFFFF" .. "pfUI skin applied." .. "|r", 0.4, 0.8, 0.4)
 		end
-		pfUI.api.StripTextures(MP.ConfigFrame, true)
-		pfUI.api.CreateBackdrop(MP.ConfigFrame, nil, nil, .75)
-		pfUI.api.CreateBackdropShadow(MP.ConfigFrame)
+		-- 边框由看板/列表两个独立框承担 (主框只有黑底), 边色随后由 Layout 覆写
+		local function skinBorder(bf)
+			if not bf then return end
+			pfUI.api.StripTextures(bf, true)
+			pfUI.api.CreateBackdrop(bf, nil, nil, .75)
+			pfUI.api.CreateBackdropShadow(bf)
+		end
+		skinBorder(MP.Work.DashBorder)
+		skinBorder(MP.Work.ListBorder)
+		if MP.ConfigFrame and MP.ConfigFrame.SetBackdropColor then
+			pcall(function() MP.ConfigFrame:SetBackdropColor(0, 0, 0, 0.8) end)
+		end
+		pcall(function() MP:Layout() end) -- 皮肤覆写边色后立刻按状态刷回
 	end)
 
 	if not pfUI.skin["MartletPoison"] then return false end
