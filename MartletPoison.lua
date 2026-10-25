@@ -883,47 +883,10 @@ function MP:RemoveWeaponSet(gi)
 	MP.Work.dirty = 1
 end
 
--- 候选槽左键: 给背包里那把武器补涂上次的毒
+-- 候选槽左键: 背包里的武器无法程序化涂毒 (引擎把 UseContainerItem 当成装备), 只做引导
 function MP:ReapplySetWeapon(set, hand)
-	local prefix = (hand == "MH") and "mh" or "oh"
-	local last = set[prefix .. "Poison"] or 0
-	if last == 0 then
-		logMsg(L("这把武器还没选过毒, 右键它先选", "No poison chosen for this weapon yet, right-click it first"))
-		return
-	end
-	MP:ApplyToBaggedWeapon(last, set, hand)
-end
-
--- 给背包里的武器涂毒 (连招待验证: 毒→武器都在包里的 UseContainerItem 组合)
-function MP:ApplyToBaggedWeapon(typeId, set, hand)
-	local prefix = (hand == "MH") and "mh" or "oh"
-	if MP.Work.iSCasting then return end
-	local wbag, wslot = MP:LocateSetWeapon(set, hand)
-	if not wbag then
-		logMsg(L("背包里找不到这把武器", "Weapon not found in bags"))
-		return
-	end
-	local pbag, pslot = MP:FindItem(typeId)
-	if not pbag then
-		local nm = L(MP.Types[typeId].name, MP.Types[typeId].nameEN)
-		logMsg(L("未发现" .. nm .. "。", "No " .. nm .. " found."))
-		return
-	end
-	MP.Frame:RegisterEvent("SPELLCAST_START")
-	MP.Frame:RegisterEvent("SPELLCAST_STOP")
-	MP.Frame:RegisterEvent("SPELLCAST_INTERRUPTED")
-	MP.Frame:RegisterEvent("SPELLCAST_FAILED")
-	UseContainerItem(pbag, pslot)
-	UseContainerItem(wbag, wslot)
-	-- 已有附魔会弹确认框, 自动点确认
-	pcall(function()
-		if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1Button1 then
-			StaticPopup1Button1:Click()
-		end
-	end)
-	set[prefix .. "Poison"] = typeId
-	logMsg(L("已尝试给包中武器涂毒 (若未生效请反馈)", "Tried to apply to bagged weapon (report if it did not work)"))
-	MP.Work.dirty = 1
+	logMsg(L("包中武器暂不支持程序化涂毒: 手动涂法 = 右键毒药 → 点包里的武器; 或换上后用看板左键补涂",
+		"Bagged weapons can't be poisoned programmatically: apply manually (use poison, then click the bagged weapon), or equip first"))
 end
 
 -- 换装: 切到候选组 (武器上的毒随之生效)
@@ -1067,10 +1030,12 @@ function MP:MenuApply(typeId)
 	local target = MP.Work.MenuTarget
 	if not target then return end
 	if target.set then
-		MP:ApplyToBaggedWeapon(typeId, target.set, target.hand)
-	else
-		MP:Apply(typeId, target.hand)
+		-- 背包里的武器无法程序化涂毒 (实测引擎把对包中武器的 UseContainerItem 当成装备)
+		logMsg(L("包中武器暂不支持程序化涂毒: 手动涂法 = 右键毒药 → 点包里的武器; 或换上后再右键选毒",
+			"Bagged weapons can't be poisoned programmatically: apply manually (use poison, then click the bagged weapon), or equip first"))
+		return
 	end
+	MP:Apply(typeId, target.hand)
 end
 
 -- ==================== UI 构建 ====================
@@ -1380,7 +1345,13 @@ function MP:ConfigureUI()
 			MP:MenuApply(t)
 		end)
 		btn:SetScript("OnEnter", function()
-			MP:ShowTooltip(btn, t, L("点击 给这把武器上这个毒", "Click: apply to this weapon"))
+			local hint
+			if MP.Work.MenuTarget and MP.Work.MenuTarget.set then
+				hint = L("包中武器: 需手动涂 (右键毒药 → 点包里的武器)", "Bagged weapon: apply manually (use poison, click it in bag)")
+			else
+				hint = L("点击 给这把武器上这个毒", "Click: apply to this weapon")
+			end
+			MP:ShowTooltip(btn, t, hint)
 		end)
 		btn:SetScript("OnLeave", function()
 			GameTooltip:Hide()
