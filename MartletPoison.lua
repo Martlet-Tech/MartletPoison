@@ -1,6 +1,7 @@
--- MartletPoison 0.3.0 看板版
+-- MartletPoison 0.4.0 武器槽版
 -- 所见即所涂的涂毒助手。基于 EzPoison (Sunelegy/qyj) 的成熟逻辑改造。
--- 双看板(主手/副手) + 四角信息(次数/时间/等级/库存) + 有货/全量列表(向上弹出)。
+-- 看板主体=当前武器, 毒药为左下角标(没涂=红叉); 武器图标右键弹竖排毒药列表;
+-- 候选武器槽: 空槽摆包里武器, 一键换装(切武器=瞬切毒药)。
 -- 双语: 物品匹配中文/英文客户端通用 (背包按物品ID匹配, 武器按双语名匹配)。
 -- 面板显示武器状态而非背包库存; 点击=涂抹; 无影响行为的隐藏状态。
 
@@ -110,11 +111,21 @@ MP.Work = {
 	activeOH = nil, rankOH = nil,
 	counts = {},        -- 背包各种类总数
 	rankCounts = {},    -- 背包各等级数量 [type][rankIdx]
+	bagIdCounts = {},   -- 背包物品ID -> 总数 (武器库存角标用)
 	ID2ENTRY = {},      -- 物品ID -> {t=种类, r=等级序号} (语言无关匹配)
 	UsableOrder = {},   -- 排序后的可用种类列表
-	ListMode = nil,     -- nil/"stock"/"all" (会话态, 不存档)
+	SetArea = nil,      -- 候选武器槽区展开 (会话态)
+	MenuOpen = nil,     -- 右键毒药列表打开中 (会话态)
+	MenuAnchor = nil,   -- 列表锚点按钮
+	MenuTarget = nil,   -- { hand="MH" } 或 { set=..., hand="MH" }
+	MenuMode = nil,     -- 本次列表模式覆盖 (nil=用 ListDefault)
 	DashIcons = {},     -- ["MH"/"OH"] = 看板按钮
-	ListIcons = {},     -- [type] = 列表按钮
+	MenuIcons = {},     -- [type] = 右键列表按钮
+	SetUI = {},         -- 候选武器槽 UI (groups/add/toggle)
+	SwapQueue = nil,    -- 换装队列 { {bag,slot,invSlot}, ... }
+	SwapNextAt = 0,     -- 下一次换装操作时间戳
+	SwapSetIdx = nil,
+	SwapStartedAt = nil,
 	Time = 0,
 	Tick = 0,
 	iSCasting = nil,
@@ -188,6 +199,8 @@ local function initConfig()
 			isVisible = 1,
 			LastMH = 0,         -- 该手最后涂的种类 (看板显示+补涂用)
 			LastOH = 0,
+			WeaponSets = {},    -- 候选武器槽 { {mhId, ohId, mhPoison, ohPoison, mhBag, mhSlot, ohBag, ohSlot} }
+			ListDefault = "stock", -- 右键列表默认内容: stock=有货 / all=全部可用 (/mpoison listmode 切换)
 			MaxCharges = {},    -- 涂抹时自动标定的满次数
 			MaxDuration = {},   -- 满时长 ms
 			TimeWarn = 5,       -- 时间 <N 分钟时时间角标红 (阈值可调)
@@ -198,7 +211,7 @@ end
 
 -- ==================== 背包扫描 ====================
 function MP:BagScan()
-	local counts, rankCounts = {}, {}
+	local counts, rankCounts, idCounts = {}, {}, {}
 	for t = 1, 15 do rankCounts[t] = {} end
 	for i = 0, 4 do
 		local n = GetContainerNumSlots(i)
@@ -208,13 +221,17 @@ function MP:BagScan()
 				if link then
 					-- 按物品ID匹配, 与客户端语言无关
 					local _, _, idStr = string.find(link, "|Hitem:(%d+)")
-					local e = idStr and MP.Work.ID2ENTRY[tonumber(idStr)]
-					if e then
+					local id = idStr and tonumber(idStr)
+					if id then
 						local _, c = GetContainerItemInfo(i, j)
 						if c and c < 0 then c = c * -1 end
 						c = c or 0
-						rankCounts[e.t][e.r] = (rankCounts[e.t][e.r] or 0) + c
-						counts[e.t] = (counts[e.t] or 0) + c
+						idCounts[id] = (idCounts[id] or 0) + c
+						local e = MP.Work.ID2ENTRY[id]
+						if e then
+							rankCounts[e.t][e.r] = (rankCounts[e.t][e.r] or 0) + c
+							counts[e.t] = (counts[e.t] or 0) + c
+						end
 					end
 				end
 			end
@@ -222,6 +239,7 @@ function MP:BagScan()
 	end
 	MP.Work.counts = counts
 	MP.Work.rankCounts = rankCounts
+	MP.Work.bagIdCounts = idCounts
 end
 
 -- 找背包里该种类最高等级的一瓶, 返回 bag, slot, itemId (按物品ID匹配)
@@ -251,7 +269,56 @@ function MP:FindItem(typeId, skipTopRank)
 end
 
 -- ==================== 武器附魔状态 ====================
--- 解析武器 tooltip, 返回 种类id, 等级序号 (双语名匹配; 等级来自行内后缀, 高等级优先避免 II/III 子串误匹配)
+-- 附魔行匹配: 返回 种类id, 等级序号 (双语名匹配; 等级来自行内后缀, 高等级优先避免 II/III 子串误匹配)
+local function matchEnchantLine(line)
+	if not line then return nil end
+	local lowerText = gsub(string.lower(line), "-", "")
+	for _, t in ipairs(MP.Work.UsableOrder) do
+		local cands = MP.MatchCands[t]
+		local hit = nil
+		for _, c in ipairs(cands) do
+			if string.find(lowerText, c, 1, true) then
+				hit = c
+				break
+			end
+		end
+		if hit then
+			local rank = table.getn(MP.RANKS[t]) -- 无后缀 = 基础等级(列表末位)
+			for r = 1, table.getn(MP.RANKS[t]) do
+				if MP.RANKS[t][r][1] ~= "" then
+					local suffixCN = gsub(string.lower(MP.Types[t].name .. MP.RANKS[t][r][1]), "-", "")
+					local suffixEN = gsub(string.lower(MP.Types[t].nameEN .. MP.RANKS[t][r][1]), "-", "")
+					if string.find(lowerText, suffixCN, 1, true) or string.find(lowerText, suffixEN, 1, true) then
+						rank = r
+						break
+					end
+				end
+			end
+			return t, rank
+		end
+	end
+	return nil
+end
+
+-- 遍历 tooltip 文本行执行匹配 (装备栏与背包共用)
+local function scanParserLines()
+	local parser = MP.Parser
+	local pname = parser:GetName()
+	for i = 1, 20 do
+		local fs = getglobal(pname .. "TextLeft" .. i)
+		if fs then
+			local t, rank = matchEnchantLine(fs:GetText())
+			if t then
+				parser:Hide()
+				return t, rank
+			end
+		end
+	end
+	parser:Hide()
+	return nil
+end
+
+-- 解析武器槽 tooltip, 返回 种类id, 等级序号
 function MP:ScanHand(slot)
 	local parser = MP.Parser
 	parser:SetOwner(UIParent, "ANCHOR_NONE")
@@ -260,44 +327,94 @@ function MP:ScanHand(slot)
 		parser:Hide()
 		return nil
 	end
+	return scanParserLines()
+end
+
+-- 解析背包里武器的 tooltip, 返回 种类id, 等级序号, 剩余次数 (候选武器槽角标用)
+function MP:ScanBagWeapon(bag, slot)
+	local parser = MP.Parser
+	parser:SetOwner(UIParent, "ANCHOR_NONE")
+	local ok = parser:SetBagItem(bag, slot)
+	if not ok then
+		parser:Hide()
+		return nil
+	end
 	local pname = parser:GetName()
+	local t, rank = scanParserLines()
+	-- 剩余次数: 行内 "N次" / "N charges"
+	local charges
 	for i = 1, 20 do
 		local fs = getglobal(pname .. "TextLeft" .. i)
 		if fs then
 			local line = fs:GetText()
 			if line then
-				local lowerText = gsub(string.lower(line), "-", "")
-				for _, t in ipairs(MP.Work.UsableOrder) do
-					local cands = MP.MatchCands[t]
-					local hit = nil
-					for _, c in ipairs(cands) do
-						if string.find(lowerText, c, 1, true) then
-							hit = c
-							break
+				local _, _, cs = string.find(line, "(%d+)%s*次")
+				if not cs then _, _, cs = string.find(line, "(%d+)%s*[Cc]harges") end
+				if cs then charges = tonumber(cs) end
+			end
+		end
+	end
+	parser:Hide()
+	return t, rank, charges
+end
+
+-- 背包里按物品ID找一件, 返回 bag, slot
+function MP:FindBagItemById(id)
+	for i = 0, 4 do
+		local n = GetContainerNumSlots(i)
+		for j = 1, n do
+			local link = GetContainerItemLink(i, j)
+			if link then
+				local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+				if idStr and tonumber(idStr) == id then
+					return i, j
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- 定位候选槽武器: 最近位置(位置上ID对得上优先) → 扫ID+期望毒匹配 → 任意同ID
+function MP:LocateSetWeapon(set, hand)
+	local prefix = (hand == "MH") and "mh" or "oh"
+	local wantId = set[prefix .. "Id"]
+	if not wantId or wantId == 0 then return nil end
+	local wantPoison = set[prefix .. "Poison"] or 0
+	local lb, ls = set[prefix .. "Bag"], set[prefix .. "Slot"]
+	if lb and ls then
+		local link = GetContainerItemLink(lb, ls)
+		if link then
+			local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+			if idStr and tonumber(idStr) == wantId then
+				return lb, ls
+			end
+		end
+	end
+	local fallbackBag, fallbackSlot
+	for i = 0, 4 do
+		local n = GetContainerNumSlots(i)
+		for j = 1, n do
+			local link = GetContainerItemLink(i, j)
+			if link then
+				local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+				if idStr and tonumber(idStr) == wantId then
+					if not fallbackBag then fallbackBag, fallbackSlot = i, j end
+					if wantPoison > 0 then
+						local t = MP:ScanBagWeapon(i, j)
+						if t == wantPoison then
+							set[prefix .. "Bag"], set[prefix .. "Slot"] = i, j
+							return i, j
 						end
-					end
-					if hit then
-						-- 等级: 双语 "名称+后缀" 从高到低匹配
-						local rank = table.getn(MP.RANKS[t]) -- 无后缀 = 基础等级(列表末位)
-						for r = 1, table.getn(MP.RANKS[t]) do
-							if MP.RANKS[t][r][1] ~= "" then
-								local suffixCN = gsub(string.lower(MP.Types[t].name .. MP.RANKS[t][r][1]), "-", "")
-								local suffixEN = gsub(string.lower(MP.Types[t].nameEN .. MP.RANKS[t][r][1]), "-", "")
-								if string.find(lowerText, suffixCN, 1, true) or string.find(lowerText, suffixEN, 1, true) then
-									rank = r
-									break
-								end
-							end
-						end
-						parser:Hide()
-						return t, rank
 					end
 				end
 			end
 		end
 	end
-	parser:Hide()
-	return nil
+	if fallbackBag then
+		set[prefix .. "Bag"], set[prefix .. "Slot"] = fallbackBag, fallbackSlot
+	end
+	return fallbackBag, fallbackSlot
 end
 
 -- ==================== 颜色/格式 ====================
@@ -359,43 +476,42 @@ local function handPct(hand)
 	return nil
 end
 
--- ==================== 看板四角 ====================
--- 返回: typeId, 次数文字+RGB, 时间文字+RGB, 等级文字, 库存
+-- ==================== 看板四角 (武器主体) ====================
+-- 返回: 武器ID, 次数文字+RGB, 时间文字+RGB, 毒药种类(左下角标, nil=红叉), 武器背包库存
 function MP:DashCorners(hand)
 	local si = MP.Work.slotInfo
 	local has, exp, chg
+	local active
+	local last
+	local slot = (hand == "MH") and 16 or 17
 	if hand == "MH" then
 		has, exp, chg = si[1], si[2], si[3]
+		active = MP.Work.activeMH
+		last = MPcfg.LastMH or 0
 	else
 		has, exp, chg = si[4], si[5], si[6]
-	end
-	local active, rank
-	if hand == "MH" then
-		active, rank = MP.Work.activeMH, MP.Work.rankMH
-	else
-		active, rank = MP.Work.activeOH, MP.Work.rankOH
-	end
-	local last
-	if hand == "MH" then last = MPcfg.LastMH or 0 else last = MPcfg.LastOH or 0 end
-
-	local typeId = nil
-	if has and active then
-		typeId = active
-	elseif last ~= 0 then
-		typeId = last
-	end
-	if not typeId then
-		return nil -- 全空: 无记忆
+		active = MP.Work.activeOH
+		last = MPcfg.LastOH or 0
 	end
 
-	local isPoison = typeId <= 8
+	local weaponId
+	local link = GetInventoryItemLink("player", slot)
+	if link then
+		local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+		weaponId = idStr and tonumber(idStr)
+	end
+	if not weaponId then
+		-- 没装备武器: 图标空槽, 无角标
+		return weaponId, "", 1, 1, 1, "", 1, 1, 1, nil, 0
+	end
+
+	local isPoison = active and active <= 8
 	local cT, cR, cG, cB
 	local tT, tR, tG, tB
-	local rankT
 
-	if has and active == typeId then
+	if active then
 		if isPoison and chg and chg > 0 then
-			local max = MPcfg.MaxCharges[typeId] or 30
+			local max = MPcfg.MaxCharges[active] or 30
 			local col = pctColor(chg / max)
 			cT, cR, cG, cB = tostring(chg), col[1], col[2], col[3]
 		elseif isPoison then
@@ -404,32 +520,24 @@ function MP:DashCorners(hand)
 			cT, cR, cG, cB = MP.INF_CHAR, COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3]
 		end
 		if exp then
-			local max = MPcfg.MaxDuration[typeId] or 1800000
+			local max = MPcfg.MaxDuration[active] or 1800000
 			local col = pctColor(exp / max)
 			tT, tR, tG, tB = fmtTime(exp), col[1], col[2], col[3]
 		else
 			tT, tR, tG, tB = "", 1, 1, 1
 		end
-		if rank then
-			local suf = MP.RANKS[typeId][rank][1]
-			rankT = gsub(suf, " ", "")
-			if rankT == "" then rankT = "-" end
-		else
-			rankT = "-"
-		end
 	else
-		-- 空手有记忆: 红 0 常驻, 方便无脑补涂
-		if isPoison then
+		-- 武器在而毒没了: 次数角红 0 (有记忆时), 角标红叉, 方便左键无脑补涂
+		if last ~= 0 then
 			cT, cR, cG, cB = "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
 		else
-			cT, cR, cG, cB = MP.INF_CHAR, COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3]
+			cT, cR, cG, cB = "", 1, 1, 1
 		end
-		tT, tR, tG, tB = "0", COLOR_RED[1], COLOR_RED[2], COLOR_RED[3]
-		rankT = "-"
+		tT, tR, tG, tB = "", 1, 1, 1
 	end
 
-	local stock = MP.Work.counts[typeId] or 0
-	return typeId, cT, cR, cG, cB, tT, tR, tG, tB, rankT, stock
+	local stock = weaponId and (MP.Work.bagIdCounts[weaponId] or 0) or 0
+	return weaponId, cT, cR, cG, cB, tT, tR, tG, tB, active, stock
 end
 
 -- 剩余量文字 (tooltip 用)
@@ -453,7 +561,8 @@ function MP:RemainText(typeId, hand)
 end
 
 -- ==================== 图标状态刷新 ====================
-function MP:UpdateIcons()
+-- scanCands: 是否重扫候选槽武器状态 (背包/装备变化后的全量刷新才扫, 秒级心跳不扫)
+function MP:UpdateIcons(scanCands)
 	local si = MP.Work.slotInfo
 
 	-- 满值标定: 附魔刚涂上时次数/时间即满值 (自校准, 含乌龟服自定义物品)
@@ -475,43 +584,125 @@ function MP:UpdateIcons()
 		end
 	end
 
-	-- 看板四角
+	-- 看板: 武器主体 + 毒角标
 	for _, hand in ipairs(hands) do
 		local dash = MP.Work.DashIcons[hand]
 		if dash then
-			local typeId, cT, cR, cG, cB, tT, tR, tG, tB, rankT, stock = MP:DashCorners(hand)
-			if typeId then
-				local active
-				if hand == "MH" then active = MP.Work.activeMH else active = MP.Work.activeOH end
-				dash.typeId = typeId
-				dash.Icon:SetTexture(MP.Types[typeId].icon)
-				dash:SetAlpha(active and 1 or 0.55)
-				dash.cTL:SetText(cT); dash.cTL:SetTextColor(cR, cG, cB)
-				dash.cTR:SetText(tT); dash.cTR:SetTextColor(tR, tG, tB)
-				dash.cBL:SetText(rankT); dash.cBL:SetTextColor(0.85, 0.85, 0.85)
-				dash.cBR:SetText(tostring(stock)); dash.cBR:SetTextColor(1, 1, 1)
+			local weaponId, cT, cR, cG, cB, tT, tR, tG, tB, badgeType, stock = MP:DashCorners(hand)
+			local active = (hand == "MH") and MP.Work.activeMH or MP.Work.activeOH
+			local last = (hand == "MH") and (MPcfg.LastMH or 0) or (MPcfg.LastOH or 0)
+			local slot = (hand == "MH") and 16 or 17
+			dash.typeId = active or (last ~= 0 and last or nil)
+			if weaponId then
+				dash.Icon:SetTexture(GetInventoryItemTexture("player", slot) or "Interface\\Buttons\\UI-EmptySlot")
+				dash:SetAlpha(1)
 			else
-				dash.typeId = nil
 				dash.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
 				dash:SetAlpha(0.4)
-				dash.cTL:SetText(""); dash.cTR:SetText("")
-				dash.cBL:SetText("-"); dash.cBL:SetTextColor(0.6, 0.6, 0.6)
-				dash.cBR:SetText("0"); dash.cBR:SetTextColor(1, 1, 1)
+			end
+			-- 左下毒角标: 已涂=毒图标, 没涂=红叉, 没武器=隐藏
+			if weaponId then
+				if badgeType then
+					dash.Poison:SetTexture(MP.Types[badgeType].icon)
+				else
+					dash.Poison:SetTexture(MP.RED_X_ICON)
+				end
+				dash.Poison:Show()
+			else
+				dash.Poison:Hide()
+			end
+			dash.cTL:SetText(cT); dash.cTL:SetTextColor(cR, cG, cB)
+			dash.cTR:SetText(tT); dash.cTR:SetTextColor(tR, tG, tB)
+			dash.cBL:SetText(""); 
+			dash.cBR:SetText(tostring(stock)); dash.cBR:SetTextColor(1, 1, 1)
+		end
+	end
+
+	MP:UpdateSetUI(scanCands)
+	if MP.Work.MenuOpen then MP:LayoutMenu() end
+
+	MP:Layout() -- 候选组显隐/尺寸随状态变化
+end
+
+-- ==================== 候选武器槽刷新 ====================
+function MP:UpdateSetUI(scanCands)
+	local setNeedsScan = scanCands or MP.Work.dirtySetSlots
+	for gi = 1, table.getn(MPcfg.WeaponSets) do
+		local set = MPcfg.WeaponSets[gi]
+		local ui = MP.Work.SetUI.groups[gi]
+		if set and ui then
+			-- 当前装备中的组: 标亮 + 大按钮置灰
+			local curMH, curOH = MP:EquippedWeaponIds()
+			ui.isCurrent = (set.mhId or 0) ~= 0 and set.mhId == curMH and set.ohId == curOH
+			MP:UpdateSetSlot(set, "MH", ui.mh, setNeedsScan)
+			MP:UpdateSetSlot(set, "OH", ui.oh, setNeedsScan)
+		end
+	end
+	MP.Work.dirtySetSlots = nil
+end
+
+-- 当前装备的两把武器 ID
+function MP:EquippedWeaponIds()
+	local ids = {}
+	for _, slot in ipairs({ 16, 17 }) do
+		local link = GetInventoryItemLink("player", slot)
+		if link then
+			local _, _, idStr = string.find(link, "|Hitem:(%d+)")
+			ids[slot] = idStr and tonumber(idStr) or 0
+		else
+			ids[slot] = 0
+		end
+	end
+	return ids[16], ids[17]
+end
+
+function MP:UpdateSetSlot(set, hand, btn, needsScan)
+	local prefix = (hand == "MH") and "mh" or "oh"
+	local id = set[prefix .. "Id"]
+	if not id or id == 0 then
+		btn.itemId = nil
+		btn.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
+		btn.Poison:Hide()
+		btn.cTL:SetText("")
+		btn.cTR:SetText("")
+		btn.cBR:SetText("")
+		return
+	end
+	btn.itemId = id
+	btn.Icon:SetTexture(GetItemIcon(id) or "Interface\\Buttons\\UI-EmptySlot")
+
+	local t, charges
+	if needsScan then
+		local bag, slot = MP:LocateSetWeapon(set, hand)
+		if bag then
+			t, _, charges = MP:ScanBagWeapon(bag, slot)
+			if t then
+				set[prefix .. "Poison"] = t -- 毒类型跟武器走; 耗尽(扫不到)时保留记忆
 			end
 		end
 	end
+	local poison = set[prefix .. "Poison"] or 0
 
-	-- 列表项: 只显示库存
-	for _, t in ipairs(MP.Work.UsableOrder) do
-		local item = MP.Work.ListIcons[t]
-		if item then
-			local c = MP.Work.counts[t] or 0
-			item.bStock:SetText(tostring(c))
-			item:SetAlpha(c == 0 and 0.35 or 1)
-		end
+	if t then
+		btn.Poison:SetTexture(MP.Types[t].icon)
+	else
+		btn.Poison:SetTexture(MP.RED_X_ICON) -- 没涂毒 / 毒已耗尽
 	end
+	btn.Poison:Show()
 
-	MP:Layout() -- 有货模式的显隐随库存变化
+	if t and t <= 8 and charges and charges > 0 then
+		local max = MPcfg.MaxCharges[t] or 30
+		local col = pctColor(charges / max)
+		btn.cTL:SetText(tostring(charges)); btn.cTL:SetTextColor(col[1], col[2], col[3])
+	elseif t and t <= 8 then
+		btn.cTL:SetText("0"); btn.cTL:SetTextColor(COLOR_RED[1], COLOR_RED[2], COLOR_RED[3])
+	elseif t then
+		btn.cTL:SetText(MP.INF_CHAR); btn.cTL:SetTextColor(COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3])
+	else
+		btn.cTL:SetText("")
+	end
+	btn.cTR:SetText(t and "-" or "") -- 背包里的武器读不到剩余时间
+	btn.cBR:SetText(tostring(MP.Work.bagIdCounts[id] or 0)); btn.cBR:SetTextColor(1, 1, 1)
 end
 
 function MP:Refresh()
@@ -536,7 +727,7 @@ function MP:Refresh()
 	if MP.Work.activeOH then MPcfg.LastOH = MP.Work.activeOH end
 
 	MP:BagScan()
-	MP:UpdateIcons()
+	MP:UpdateIcons(1)
 end
 
 -- ==================== 涂抹 (连招移植自 EzPoison.ApplyPoisen) ====================
@@ -613,23 +804,20 @@ function MP:Reapply(hand)
 	MP:Apply(last, hand)
 end
 
--- ==================== 列表 ====================
-function MP:ToggleList(mode)
-	if MP.Work.ListMode == mode then
-		MP.Work.ListMode = nil
-	else
-		MP.Work.ListMode = mode
-	end
-	MP:Layout()
-end
-
--- ==================== UI 构建 ====================
+-- ==================== UI 常量 (前置: 菜单/候选函数引用) ====================
 local PAD = 5      -- 面板内边距
 local DASH = 40    -- 看板图标尺寸
-local LICON = 32   -- 列表图标尺寸
-local STEP = 36    -- 列表项步进
+local LICON = 32   -- 右键列表图标尺寸
+local STEP = 36    -- 右键列表项步进
 local GAP = 6      -- 看板间距 / 行距
 local BMARGIN = 2  -- 独立边框外扩留白
+local SW = 40      -- 候选槽武器图标尺寸
+local SBW = 56     -- 换装大按钮宽
+local SBH = 16     -- 候选按钮行高
+local GG = 10      -- 候选组间距
+local CH = SW + 3 + SBH -- 候选组内容高度
+
+MP.RED_X_ICON = "Interface\\Buttons\\UI-GroupLoot-Pass-Up" -- 没涂毒的红叉角标
 
 -- 边框颜色设置 (兼容 pfUI 的独立 backdrop)
 local function setGroupBorder(frame, r, g, b, a)
@@ -641,6 +829,216 @@ local function setGroupBorder(frame, r, g, b, a)
 	end
 end
 
+-- ==================== 候选武器槽 / 右键列表 / 换装 ====================
+local SET_LIMIT = 4 -- 候选组上限
+
+function MP:AddWeaponSet()
+	if table.getn(MPcfg.WeaponSets) >= SET_LIMIT then
+		logMsg(L("候选武器槽已满 (" .. SET_LIMIT .. " 组)", "Weapon set limit reached (" .. SET_LIMIT .. ")"))
+		return
+	end
+	table.insert(MPcfg.WeaponSets, { mhId = 0, ohId = 0, mhPoison = 0, ohPoison = 0 })
+	MP.Work.dirtySetSlots = 1
+	MP.Work.dirty = 1
+end
+
+function MP:RemoveWeaponSet(gi)
+	table.remove(MPcfg.WeaponSets, gi)
+	if table.getn(MPcfg.WeaponSets) == 0 then
+		MP:AddWeaponSet() -- 全删了留一套空槽, 界面不空
+	end
+	MP.Work.dirty = 1
+end
+
+-- 候选槽左键: 给背包里那把武器补涂上次的毒
+function MP:ReapplySetWeapon(set, hand)
+	local prefix = (hand == "MH") and "mh" or "oh"
+	local last = set[prefix .. "Poison"] or 0
+	if last == 0 then
+		logMsg(L("这把武器还没选过毒, 右键它先选", "No poison chosen for this weapon yet, right-click it first"))
+		return
+	end
+	MP:ApplyToBaggedWeapon(last, set, hand)
+end
+
+-- 给背包里的武器涂毒 (连招待验证: 毒→武器都在包里的 UseContainerItem 组合)
+function MP:ApplyToBaggedWeapon(typeId, set, hand)
+	local prefix = (hand == "MH") and "mh" or "oh"
+	if MP.Work.iSCasting then return end
+	local wbag, wslot = MP:LocateSetWeapon(set, hand)
+	if not wbag then
+		logMsg(L("背包里找不到这把武器", "Weapon not found in bags"))
+		return
+	end
+	local pbag, pslot = MP:FindItem(typeId)
+	if not pbag then
+		local nm = L(MP.Types[typeId].name, MP.Types[typeId].nameEN)
+		logMsg(L("未发现" .. nm .. "。", "No " .. nm .. " found."))
+		return
+	end
+	MP.Frame:RegisterEvent("SPELLCAST_START")
+	MP.Frame:RegisterEvent("SPELLCAST_STOP")
+	MP.Frame:RegisterEvent("SPELLCAST_INTERRUPTED")
+	MP.Frame:RegisterEvent("SPELLCAST_FAILED")
+	UseContainerItem(pbag, pslot)
+	UseContainerItem(wbag, wslot)
+	-- 已有附魔会弹确认框, 自动点确认
+	pcall(function()
+		if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1Button1 then
+			StaticPopup1Button1:Click()
+		end
+	end)
+	set[prefix .. "Poison"] = typeId
+	logMsg(L("已尝试给包中武器涂毒 (若未生效请反馈)", "Tried to apply to bagged weapon (report if it did not work)"))
+	MP.Work.dirty = 1
+end
+
+-- 换装: 切到候选组 (武器上的毒随之生效)
+function MP:EquipSet(gi)
+	local set = MPcfg.WeaponSets[gi]
+	if not set then return end
+	if MP.Work.SwapQueue then
+		logMsg(L("上一轮换装还没完成", "Previous swap still in progress"))
+		return
+	end
+	local queue = {}
+	local missing = nil
+	for _, hand in ipairs({ "MH", "OH" }) do
+		local prefix = (hand == "MH") and "mh" or "oh"
+		local id = set[prefix .. "Id"]
+		if id and id ~= 0 then
+			local bag, slot = MP:LocateSetWeapon(set, hand)
+			if bag then
+				table.insert(queue, { bag = bag, slot = slot, invSlot = (hand == "MH") and 16 or 17 })
+			else
+				missing = (hand == "MH") and L("主手", "MH") or L("副手", "OH")
+			end
+		end
+	end
+	if missing then
+		logMsg(L("背包里找不到候选组的" .. missing .. "武器", "Set weapon missing from bags: " .. missing))
+	end
+	if table.getn(queue) == 0 then return end
+	MP.Work.SwapQueue = queue
+	MP.Work.SwapSetIdx = gi
+	MP.Work.SwapNextAt = GetTime() + 0.05
+	MP.Work.SwapStartedAt = GetTime()
+	MP.Work.dirty = 1
+end
+
+-- 换装队列: 双槽不能同帧连发 (服务器异步处理, 第二笔会撞槽位锁)
+function MP:ProcessSwapQueue()
+	local q = MP.Work.SwapQueue
+	if not q then return end
+	if MP.Work.iSCasting then return end
+	if GetTime() - (MP.Work.SwapStartedAt or 0) > 5 then
+		logMsg(L("换装超时中止 (槽位被锁?)", "Swap aborted (slot locked?)"))
+		MP.Work.SwapQueue = nil
+		return
+	end
+	if GetTime() < MP.Work.SwapNextAt then return end
+	local op = q[1]
+	if IsInventoryItemLocked(op.invSlot) then
+		MP.Work.SwapNextAt = GetTime() + 0.2
+		return
+	end
+	local _, _, locked = GetContainerItemInfo(op.bag, op.slot)
+	if locked then
+		MP.Work.SwapNextAt = GetTime() + 0.2
+		return
+	end
+	PickupContainerItem(op.bag, op.slot)
+	PickupInventoryItem(op.invSlot)
+	table.remove(q, 1)
+	if table.getn(q) == 0 then
+		MP.Work.SwapQueue = nil
+		-- 记忆跟武器走: 换上的组把它的"上次毒"带给看板
+		local set = MPcfg.WeaponSets[MP.Work.SwapSetIdx]
+		if set then
+			if (set.mhPoison or 0) > 0 then MPcfg.LastMH = set.mhPoison end
+			if (set.ohPoison or 0) > 0 then MPcfg.LastOH = set.ohPoison end
+		end
+		MP.Work.SwapSetIdx = nil
+		MP.Work.dirty = 1
+	else
+		MP.Work.SwapNextAt = GetTime() + 0.25
+	end
+end
+
+-- ==================== 候选区开关 / 右键毒药列表 ====================
+function MP:ToggleSetArea()
+	if MP.Work.SetArea then
+		MP.Work.SetArea = nil
+	else
+		MP.Work.SetArea = 1
+		if table.getn(MPcfg.WeaponSets) == 0 then
+			MP:AddWeaponSet() -- 第一次展开给一套空槽
+		end
+		MP.Work.dirtySetSlots = 1 -- 展开时重扫一遍候选武器状态
+	end
+	MP:Layout()
+end
+
+-- 右键武器图标弹竖排毒药列表; 区域外任意点击关闭 (全屏拦截层)
+function MP:OpenMenu(anchorBtn, target)
+	MP.Work.MenuTarget = target
+	MP.Work.MenuAnchor = anchorBtn
+	MP.Work.MenuOpen = 1
+	if not MP.Work.CatcherInSpecialFrames then
+		MP.Work.CatcherInSpecialFrames = 1
+		table.insert(UISpecialFrames, "MartletPoisonCatcher") -- ESC 也能关
+	end
+	if MP.Catcher then MP.Catcher:Show() end
+	MP:LayoutMenu()
+end
+
+function MP:CloseMenu()
+	MP.Work.MenuOpen = nil
+	MP.Work.MenuAnchor = nil
+	MP.Work.MenuTarget = nil
+	MP.Work.MenuMode = nil
+	for _, t in ipairs(MP.Work.UsableOrder) do
+		local item = MP.Work.MenuIcons[t]
+		if item then item:Hide() end
+	end
+	if MP.Catcher and MP.Catcher:IsVisible() then
+		MP.Catcher:Hide()
+	end
+end
+
+function MP:LayoutMenu()
+	if not MP.Work.MenuOpen then return end
+	local anchor = MP.Work.MenuAnchor
+	if not anchor then return end
+	local mode = MP.Work.MenuMode or MPcfg.ListDefault or "stock"
+	local i = 0
+	for _, t in ipairs(MP.Work.UsableOrder) do
+		local item = MP.Work.MenuIcons[t]
+		local show = (mode == "all") or ((MP.Work.counts[t] or 0) > 0)
+		if show then
+			item:SetPoint("BOTTOMLEFT", anchor, "TOPLEFT", 0, 4 + i * STEP)
+			item.bStock:SetText(tostring(MP.Work.counts[t] or 0))
+			item:SetAlpha((MP.Work.counts[t] or 0) == 0 and 0.35 or 1)
+			item:Show()
+			i = i + 1
+		else
+			item:Hide()
+		end
+	end
+end
+
+-- 列表项点击: 给锚点那把武器上这个毒
+function MP:MenuApply(typeId)
+	local target = MP.Work.MenuTarget
+	if not target then return end
+	if target.set then
+		MP:ApplyToBaggedWeapon(typeId, target.set, target.hand)
+	else
+		MP:Apply(typeId, target.hand)
+	end
+end
+
+-- ==================== UI 构建 ====================
 function MP:Layout()
 	local frame = MP.ConfigFrame
 	if not frame then return end
@@ -649,11 +1047,10 @@ function MP:Layout()
 	local dashOH = MP.Work.DashIcons.OH
 	if not dashMH or not dashOH then return end
 
-	local mode = MP.Work.ListMode
 	local rowOffset = 0
-	if mode then rowOffset = STEP + GAP end
+	if MP.Work.SetArea then rowOffset = CH + GAP end
 
-	-- 列表在看板上方弹出: 展开时整体锚点上移一行, 使看板在屏幕上保持原位
+	-- 候选区在看板上方弹出: 展开时整体锚点上移, 使看板在屏幕上保持原位
 	local scale = frame:GetScale() or (MPcfg.Scale or 1)
 	frame:ClearAllPoints()
 	frame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", (MPcfg.PosX or screenCenterX) / scale, ((MPcfg.PosY or -screenCenterY) + rowOffset) / scale)
@@ -685,50 +1082,84 @@ function MP:Layout()
 		end
 	end
 
-	local listW = 0
-	local listN = 0
-	if mode then
+	-- 切换按钮: 看板组右端外侧, 常驻
+	local toggleBtn = MP.Work.SetUI.toggle
+	local toggleW = 0
+	if toggleBtn then
+		toggleBtn:ClearAllPoints()
+		toggleBtn:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD + DASH + GAP + DASH + GAP, -(PAD + rowOffset + 6))
+		toggleW = 28
+	end
+
+	-- 候选武器槽区: 横排组, 每组 [MH][OH] + 按钮行 (大按钮+删除小按钮), 独立边框
+	local candW = 0
+	if MP.Work.SetArea then
+		local n = table.getn(MPcfg.WeaponSets)
 		local x = PAD
-		for _, t in ipairs(MP.Work.UsableOrder) do
-			local item = MP.Work.ListIcons[t]
-			local show = (mode == "all") or ((MP.Work.counts[t] or 0) > 0)
-			if show then
-				item:ClearAllPoints()
-				item:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -PAD)
-				item:Show()
-				x = x + STEP
-				listN = listN + 1
-			else
-				item:Hide()
+		for gi = 1, table.getn(MPcfg.WeaponSets) do
+			local set = MPcfg.WeaponSets[gi]
+			local ui = MP.Work.SetUI.groups[gi]
+			if ui then
+				ui.mh:ClearAllPoints()
+				ui.mh:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -PAD)
+				ui.mh:Show()
+				ui.oh:ClearAllPoints()
+				ui.oh:SetPoint("TOPLEFT", frame, "TOPLEFT", x + SW + 4, -PAD)
+				ui.oh:Show()
+				ui.swap:ClearAllPoints()
+				ui.swap:SetPoint("TOPLEFT", frame, "TOPLEFT", x + (SW * 2 + 4 - SBW) / 2, -(PAD + SW + 3))
+				ui.swap:Show()
+				ui.del:ClearAllPoints()
+				ui.del:SetPoint("TOPLEFT", frame, "TOPLEFT", x + SW * 2 + 4 - 16, -(PAD + SW + 3))
+				ui.del:Show()
+				if ui.border then
+					ui.border:ClearAllPoints()
+					ui.border:SetPoint("TOPLEFT", frame, "TOPLEFT", x - BMARGIN, -(PAD - BMARGIN))
+					ui.border:SetWidth(SW * 2 + 4 + 2 * BMARGIN)
+					ui.border:SetHeight(CH + 2 * BMARGIN)
+					if ui.isCurrent then
+						setGroupBorder(ui.border, 0, 1, 0, 1)
+					else
+						setGroupBorder(ui.border, 1, 1, 1, 1)
+					end
+					ui.border:Show()
+				end
+				-- 换装按钮状态: 当前组置灰
+				if ui.isCurrent then
+					ui.swap.label:SetText(L("当前", "Current"))
+					ui.swap.label:SetTextColor(0.6, 0.6, 0.6)
+				else
+					ui.swap.label:SetText(L("换装", "Equip"))
+					ui.swap.label:SetTextColor(1, 1, 0.6)
+				end
+			end
+			x = x + SW * 2 + 4 + GG
+		end
+		-- ⊕ 加一套空槽
+		local addBtn = MP.Work.SetUI.add
+		if addBtn then
+			addBtn:ClearAllPoints()
+			addBtn:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -PAD)
+			addBtn:Show()
+		end
+		candW = x + 28 + PAD
+	else
+		local addBtn = MP.Work.SetUI.add
+		if addBtn then addBtn:Hide() end
+		local groups = MP.Work.SetUI.groups
+		if groups then
+			for gi = 1, table.getn(groups) do
+				local ui = groups[gi]
+				if ui then
+					ui.mh:Hide(); ui.oh:Hide(); ui.swap:Hide(); ui.del:Hide()
+					if ui.border then ui.border:Hide() end
+				end
 			end
 		end
-		listW = x - STEP + LICON + PAD
-	else
-		-- 收起: 藏掉所有列表项, 防止上一模式的图标残留
-		for _, t in ipairs(MP.Work.UsableOrder) do
-			local item = MP.Work.ListIcons[t]
-			if item then item:Hide() end
-		end
 	end
 
-	-- 列表独立边框: 恒白, 不做色彩警示
-	local listBorder = MP.Work.ListBorder
-	if listBorder then
-		if mode and listN > 0 then
-			local rowW = (listN - 1) * STEP + LICON
-			listBorder:ClearAllPoints()
-			listBorder:SetPoint("TOPLEFT", frame, "TOPLEFT", PAD - BMARGIN, -(PAD - BMARGIN))
-			listBorder:SetWidth(rowW + 2 * BMARGIN)
-			listBorder:SetHeight(LICON + 2 * BMARGIN)
-			setGroupBorder(listBorder, 1, 1, 1, 1)
-			listBorder:Show()
-		else
-			listBorder:Hide()
-		end
-	end
-
-	local groupW = PAD + DASH + GAP + DASH + PAD
-	local width = groupW > listW and groupW or listW
+	local groupW = PAD + DASH + GAP + DASH + GAP + toggleW + PAD
+	local width = groupW > candW and groupW or candW
 	local height = PAD + rowOffset + DASH + PAD
 	frame:SetWidth(width)
 	frame:SetHeight(height)
@@ -801,7 +1232,7 @@ function MP:ConfigureUI()
 		local currentScale = frame:GetScale() or (MPcfg.Scale or 1)
 		-- 保存基准位置 (扣除展开时锚点上移的偏移)
 		local rowOffset = 0
-		if MP.Work.ListMode then rowOffset = STEP + GAP end
+		if MP.Work.SetArea then rowOffset = CH + GAP end
 		MPcfg.PosX = x * currentScale
 		MPcfg.PosY = (y - rowOffset) * currentScale
 	end
@@ -817,7 +1248,7 @@ function MP:ConfigureUI()
 
 	buildUsableOrder()
 
-	-- 独立边框框体: 看板 (颜色随两手余量较差侧) / 列表 (恒白, 不做警示); 各自带黑底
+	-- 独立边框框体: 看板 (颜色随两手余量较差侧) / 候选组 (当前组绿, 其他白); 各自带黑底
 	local function createBorder()
 		local bf = CreateFrame("Frame", nil, frame)
 		bf:SetBackdrop({
@@ -831,88 +1262,90 @@ function MP:ConfigureUI()
 		return bf
 	end
 	MP.Work.DashBorder = createBorder()
-	MP.Work.ListBorder = createBorder()
 
 	-- 工厂函数: 迭代变量一律经参数传入 (本客户端 for 控制变量在循环后的闭包里读到 nil)
-	local function createDash(hand)
-		local btn = CreateFrame("Button", nil, frame)
-		btn.hand = hand
-		btn:SetWidth(DASH)
-		btn:SetHeight(DASH)
-		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-		btn:SetScript("OnClick", function()
-			local b = tostring(arg1 or "")
-			if b == "LeftButton" or b == "LeftButtonUp" then
-				MP:Reapply(hand)
-			elseif b == "RightButton" or b == "RightButtonUp" then
-				if IsShiftKeyDown() then
-					MP:ToggleList("all")
-				else
-					MP:ToggleList("stock")
+		local function createDash(hand)
+			local btn = CreateFrame("Button", nil, frame)
+			btn.hand = hand
+			btn:SetWidth(DASH)
+			btn:SetHeight(DASH)
+			btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+			btn:SetScript("OnClick", function()
+				local b = tostring(arg1 or "")
+				if b == "LeftButton" or b == "LeftButtonUp" then
+					MP:Reapply(hand)
+				elseif b == "RightButton" or b == "RightButtonUp" then
+					if IsShiftKeyDown() then
+						-- Shift+右键: 临时反转列表内容模式
+						MP.Work.MenuMode = ((MPcfg.ListDefault or "stock") == "stock") and "all" or "stock"
+					else
+						MP.Work.MenuMode = nil
+					end
+					MP:OpenMenu(btn, { hand = hand })
 				end
+			end)
+			btn:SetScript("OnEnter", function()
+				if btn.typeId then
+					MP:ShowTooltip(btn, btn.typeId, L("左键 补涂 | 右键 选毒列表 | Shift+右键 反转列表内容", "L: reapply | R: poison list | Shift+R: invert list mode"))
+				else
+					GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
+					GameTooltip:AddLine(L("空槽 - 右键选毒开涂", "Empty - right-click to pick a poison"), 0.8, 0.8, 0.8)
+					GameTooltip:Show()
+				end
+			end)
+			btn:SetScript("OnLeave", function()
+				GameTooltip:Hide()
+			end)
+			if btn.SetHighlightTexture then
+				btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
 			end
-		end)
-		btn:SetScript("OnEnter", function()
-			if btn.typeId then
-				MP:ShowTooltip(btn, btn.typeId, L("左键 补涂 | 右键 有货列表 | Shift+右键 全部", "L: reapply | R: stocked list | Shift+R: all"))
-			else
-				GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
-				GameTooltip:AddLine(L("空槽 - 先从列表涂一次毒", "Empty - pick a poison from the list first"), 0.8, 0.8, 0.8)
-				GameTooltip:Show()
-			end
-		end)
-		btn:SetScript("OnLeave", function()
-			GameTooltip:Hide()
-		end)
-		if btn.SetHighlightTexture then
-			btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+
+			btn.Icon = btn:CreateTexture(nil, "ARTWORK")
+			btn.Icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
+			btn.Icon:SetWidth(DASH - 4)
+			btn.Icon:SetHeight(DASH - 4)
+			btn.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
+
+			-- 左下毒角标: 已涂=毒图标 / 没涂=红叉
+			btn.Poison = btn:CreateTexture(nil, "OVERLAY")
+			btn.Poison:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 1)
+			btn.Poison:SetWidth(13)
+			btn.Poison:SetHeight(13)
+			btn.Poison:Hide()
+
+			btn.cTL = btn:CreateFontString(nil, "OVERLAY")
+			btn.cTL:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
+			btn.cTL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+			btn.cTR = btn:CreateFontString(nil, "OVERLAY")
+			btn.cTR:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -1, -1)
+			btn.cTR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+			btn.cBL = btn:CreateFontString(nil, "OVERLAY")
+			btn.cBL:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 1)
+			btn.cBL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+			btn.cBR = btn:CreateFontString(nil, "OVERLAY")
+			btn.cBR:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
+			btn.cBR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+			return btn
 		end
-
-		btn.Icon = btn:CreateTexture(nil, "ARTWORK")
-		btn.Icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
-		btn.Icon:SetWidth(DASH - 4)
-		btn.Icon:SetHeight(DASH - 4)
-		btn.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
-
-		btn.cTL = btn:CreateFontString(nil, "OVERLAY")
-		btn.cTL:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
-		btn.cTL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
-
-		btn.cTR = btn:CreateFontString(nil, "OVERLAY")
-		btn.cTR:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -1, -1)
-		btn.cTR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
-
-		btn.cBL = btn:CreateFontString(nil, "OVERLAY")
-		btn.cBL:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 1)
-		btn.cBL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
-
-		btn.cBR = btn:CreateFontString(nil, "OVERLAY")
-		btn.cBR:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
-		btn.cBR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
-
-		return btn
-	end
 	MP.Work.DashIcons.MH = createDash("MH")
 	MP.Work.DashIcons.OH = createDash("OH")
 
-	local function createListItem(t)
+	local function createMenuItem(t)
 		local btn = CreateFrame("Button", nil, frame)
 		btn.typeId = t
 		btn:SetWidth(LICON)
 		btn:SetHeight(LICON)
-		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+		btn:SetFrameStrata("TOOLTIP") -- 右键列表必须压在全屏拦截层之上
+		btn:RegisterForClicks("LeftButtonUp")
 		btn:SetScript("OnClick", function()
-			local b = tostring(arg1 or "")
-			if b == "RightButton" or b == "RightButtonUp" then
-				MP:Apply(t, "OH")
-			elseif IsShiftKeyDown() then
-				MP:Apply(t, "OH")
-			else
-				MP:Apply(t, "MH")
-			end
+			MP:MenuApply(t)
 		end)
 		btn:SetScript("OnEnter", function()
-			MP:ShowTooltip(btn, t, L("左键 涂主手 | 右键/Shift+左键 涂副手", "L: main hand | R/Shift+L: off hand"))
+			MP:ShowTooltip(btn, t, L("点击 给这把武器上这个毒", "Click: apply to this weapon"))
 		end)
 		btn:SetScript("OnLeave", function()
 			GameTooltip:Hide()
@@ -936,8 +1369,207 @@ function MP:ConfigureUI()
 		return btn
 	end
 	for _, t in ipairs(MP.Work.UsableOrder) do
-		MP.Work.ListIcons[t] = createListItem(t)
+		MP.Work.MenuIcons[t] = createMenuItem(t)
 	end
+
+	-- 全屏拦截层: 列表打开时, 插件区域外任意点击 (左/中/右) = 关闭列表
+	if not MP.Catcher then
+		MP.Catcher = CreateFrame("Button", "MartletPoisonCatcher", UIParent)
+		MP.Catcher:SetAllPoints(UIParent)
+		MP.Catcher:SetFrameStrata("DIALOG")
+		MP.Catcher:RegisterForClicks("LeftButtonUp", "RightButtonUp", "MiddleButtonUp")
+		MP.Catcher:SetScript("OnClick", function() MP:CloseMenu() end)
+		MP.Catcher:SetScript("OnHide", function()
+			if MP.Work.MenuOpen then MP:CloseMenu() end
+		end)
+		MP.Catcher:Hide()
+	end
+
+	-- ==================== 候选武器槽 UI ====================
+	local function createSetSlot(gi, hand)
+		local btn = CreateFrame("Button", nil, frame)
+		btn.gi, btn.hand, btn.prefix = gi, hand, (hand == "MH") and "mh" or "oh"
+		btn:SetWidth(SW)
+		btn:SetHeight(SW)
+		btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+		btn:SetScript("OnClick", function()
+			local b = tostring(arg1 or "")
+			local set = MPcfg.WeaponSets[btn.gi]
+			if not set then return end
+			local prefix = btn.prefix
+			-- 带武器点击 = 摆放/替换 (1.12 无拖放事件, 带物品点击 = OnClick + GetCursorInfo)
+			local ctype, ca, cb = GetCursorInfo()
+			if ctype == "item" then
+				ClearCursor() -- 物品放回原背包格
+				local bag, slot
+				if ca and cb and GetContainerItemLink(ca, cb) then
+					bag, slot = ca, cb
+				elseif type(ca) == "number" then
+					bag, slot = MP:FindBagItemById(ca)
+				end
+				if bag then
+					local link = GetContainerItemLink(bag, slot)
+					local _, _, idStr = string.find(link or "", "|Hitem:(%d+)")
+					if idStr then
+						set[prefix .. "Id"] = tonumber(idStr)
+						set[prefix .. "Bag"], set[prefix .. "Slot"] = bag, slot
+						local t = MP:ScanBagWeapon(bag, slot)
+						if t then set[prefix .. "Poison"] = t end
+						MP.Work.dirtySetSlots = 1
+						MP.Work.dirty = 1
+					end
+				end
+				return
+			end
+			local id = set[prefix .. "Id"]
+			if not id or id == 0 then return end
+			if b == "RightButton" or b == "RightButtonUp" then
+				MP.Work.MenuMode = nil
+				MP:OpenMenu(btn, { set = set, hand = hand })
+			else
+				MP:ReapplySetWeapon(set, hand)
+			end
+		end)
+		btn:SetScript("OnEnter", function()
+			GameTooltip:SetOwner(btn, "ANCHOR_RIGHT")
+			local set = MPcfg.WeaponSets[btn.gi]
+			local id = set and set[btn.prefix .. "Id"]
+			if id and id ~= 0 then
+				GameTooltip:AddLine(L("候选武器", "Candidate weapon"), 1, 1, 0.6)
+				GameTooltip:AddLine(L("左键 补涂上次毒 | 右键 选毒列表", "L: reapply last poison | R: poison list"), 0.8, 0.8, 0.8)
+				GameTooltip:AddLine(L("带武器点击 = 替换", "Click with a weapon on cursor = replace"), 0.6, 0.6, 0.6)
+			else
+				GameTooltip:AddLine(L("空槽 - 带着包里武器点一下摆上来", "Empty - click with a bagged weapon on cursor"), 0.8, 0.8, 0.8)
+			end
+			GameTooltip:Show()
+		end)
+		btn:SetScript("OnLeave", function()
+			GameTooltip:Hide()
+		end)
+		if btn.SetHighlightTexture then
+			btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+		end
+
+		btn.Icon = btn:CreateTexture(nil, "ARTWORK")
+		btn.Icon:SetPoint("CENTER", btn, "CENTER", 0, 0)
+		btn.Icon:SetWidth(SW - 4)
+		btn.Icon:SetHeight(SW - 4)
+		btn.Icon:SetTexture("Interface\\Buttons\\UI-EmptySlot")
+
+		btn.Poison = btn:CreateTexture(nil, "OVERLAY")
+		btn.Poison:SetPoint("BOTTOMLEFT", btn, "BOTTOMLEFT", 1, 1)
+		btn.Poison:SetWidth(13)
+		btn.Poison:SetHeight(13)
+		btn.Poison:Hide()
+
+		btn.cTL = btn:CreateFontString(nil, "OVERLAY")
+		btn.cTL:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
+		btn.cTL:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn.cTR = btn:CreateFontString(nil, "OVERLAY")
+		btn.cTR:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -1, -1)
+		btn.cTR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn.cBR = btn:CreateFontString(nil, "OVERLAY")
+		btn.cBR:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
+		btn.cBR:SetFont("Fonts\\ARIALN.TTF", 9, "OUTLINE")
+
+		btn:Hide()
+		return btn
+	end
+
+	local function createSetGroup(gi)
+		local ui = {}
+		ui.mh = createSetSlot(gi, "MH")
+		ui.oh = createSetSlot(gi, "OH")
+		-- 换装大按钮
+		ui.swap = CreateFrame("Button", nil, frame)
+		ui.swap.gi = gi
+		ui.swap:SetWidth(SBW)
+		ui.swap:SetHeight(SBH)
+		local swapBtn = ui.swap
+		ui.swap:SetScript("OnClick", function()
+			MP:EquipSet(swapBtn.gi)
+		end)
+		ui.swap.label = ui.swap:CreateFontString(nil, "OVERLAY")
+		ui.swap.label:SetAllPoints(ui.swap)
+		ui.swap.label:SetFont("Fonts\\ARIALN.TTF", 10, "OUTLINE")
+		ui.swap.label:SetText(L("换装", "Equip"))
+		ui.swap:Hide()
+		-- 删除小按钮 (防误触)
+		ui.del = CreateFrame("Button", nil, frame)
+		ui.del.gi = gi
+		ui.del:SetWidth(16)
+		ui.del:SetHeight(16)
+		local delBtn = ui.del
+		ui.del:SetScript("OnClick", function()
+			MP:RemoveWeaponSet(delBtn.gi)
+		end)
+		ui.del.label = ui.del:CreateFontString(nil, "OVERLAY")
+		ui.del.label:SetAllPoints(ui.del)
+		ui.del.label:SetFont("Fonts\\ARIALN.TTF", 11, "OUTLINE")
+		ui.del.label:SetText("×")
+		ui.del.label:SetTextColor(1, 0.3, 0.3)
+		if ui.del.SetHighlightTexture then
+			ui.del:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+		end
+		ui.del:Hide()
+		-- 组边框 (当前组绿色, 其他白色)
+		ui.border = createBorder()
+		ui.border:Hide()
+		return ui
+	end
+	MP.Work.SetUI.groups = {}
+	for gi = 1, SET_LIMIT do
+		MP.Work.SetUI.groups[gi] = createSetGroup(gi)
+	end
+
+	-- ⊕ 加一套空槽
+	local addBtn = CreateFrame("Button", nil, frame)
+	addBtn:SetWidth(28)
+	addBtn:SetHeight(28)
+	addBtn:SetScript("OnClick", function()
+		MP:AddWeaponSet()
+	end)
+	addBtn.tex = addBtn:CreateTexture(nil, "ARTWORK")
+	addBtn.tex:SetAllPoints(addBtn)
+	addBtn.tex:SetTexture("Interface\\Buttons\\UI-PlusButton-Up")
+	if addBtn.SetHighlightTexture then
+		addBtn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+	end
+	addBtn:SetScript("OnEnter", function()
+		GameTooltip:SetOwner(addBtn, "ANCHOR_RIGHT")
+		GameTooltip:AddLine(L("加一套候选武器槽", "Add a weapon set"), 0.8, 0.8, 0.8)
+		GameTooltip:Show()
+	end)
+	addBtn:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+	addBtn:Hide()
+	MP.Work.SetUI.add = addBtn
+
+	-- 切换按钮: 展开/收起候选武器槽区 (常驻, 看板右端)
+	local toggleBtn = CreateFrame("Button", nil, frame)
+	toggleBtn:SetWidth(28)
+	toggleBtn:SetHeight(28)
+	toggleBtn:SetScript("OnClick", function()
+		MP:ToggleSetArea()
+	end)
+	toggleBtn.tex = toggleBtn:CreateTexture(nil, "ARTWORK")
+	toggleBtn.tex:SetAllPoints(toggleBtn)
+	toggleBtn.tex:SetTexture("Interface\\Icons\\Ability_Rogue_DualWeild")
+	if toggleBtn.SetHighlightTexture then
+		toggleBtn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+	end
+	toggleBtn:SetScript("OnEnter", function()
+		GameTooltip:SetOwner(toggleBtn, "ANCHOR_RIGHT")
+		GameTooltip:AddLine(L("武器槽: 展开/收起候选换装区", "Weapon sets: toggle candidate area"), 0.8, 0.8, 0.8)
+		GameTooltip:Show()
+	end)
+	toggleBtn:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+	MP.Work.SetUI.toggle = toggleBtn
 
 	frame:SetScale(MPcfg.Scale or 1)
 	frame:ClearAllPoints()
@@ -972,8 +1604,14 @@ function MP:ApplyLockPosition()
 	keepMouse(MP.Work.DashIcons.MH)
 	keepMouse(MP.Work.DashIcons.OH)
 	for _, t in ipairs(MP.Work.UsableOrder) do
-		keepMouse(MP.Work.ListIcons[t])
+		keepMouse(MP.Work.MenuIcons[t])
 	end
+	for gi = 1, table.getn(MP.Work.SetUI.groups) do
+		local ui = MP.Work.SetUI.groups[gi]
+		keepMouse(ui.mh); keepMouse(ui.oh); keepMouse(ui.swap); keepMouse(ui.del)
+	end
+	keepMouse(MP.Work.SetUI.add)
+	keepMouse(MP.Work.SetUI.toggle)
 end
 
 function MP:ApplyScale(newScale)
@@ -1024,8 +1662,16 @@ local function skinAllIcons()
 	skin(MP.Work.DashIcons.MH)
 	skin(MP.Work.DashIcons.OH)
 	for _, t in ipairs(MP.Work.UsableOrder) do
-		skin(MP.Work.ListIcons[t])
+		skin(MP.Work.MenuIcons[t])
 	end
+	for gi = 1, table.getn(MP.Work.SetUI.groups) do
+		local ui = MP.Work.SetUI.groups[gi]
+		if ui then
+			skin(ui.mh); skin(ui.oh); skin(ui.add)
+		end
+	end
+	if MP.Work.SetUI.add then skin(MP.Work.SetUI.add) end
+	if MP.Work.SetUI.toggle then skin(MP.Work.SetUI.toggle) end
 end
 
 local function ensureSkinLoaded()
@@ -1065,7 +1711,7 @@ local function registerSkin()
 			skinChatOnce = true
 			DEFAULT_CHAT_FRAME:AddMessage("MartletPoison: " .. "|cFFFFFFFF" .. "pfUI skin applied." .. "|r", 0.4, 0.8, 0.4)
 		end
-		-- 黑底+边框由看板/列表两个独立框承担 (主框不可见), 边色随后由 Layout 覆写
+		-- 黑底+边框由看板/候选组独立框承担 (主框不可见), 边色随后由 Layout 覆写
 		local function skinBorder(bf)
 			if not bf then return end
 			pfUI.api.StripTextures(bf, true)
@@ -1073,7 +1719,10 @@ local function registerSkin()
 			pfUI.api.CreateBackdropShadow(bf)
 		end
 		skinBorder(MP.Work.DashBorder)
-		skinBorder(MP.Work.ListBorder)
+		for gi = 1, table.getn(MP.Work.SetUI.groups) do
+			local ui = MP.Work.SetUI.groups[gi]
+			if ui then skinBorder(ui.border) end
+		end
 		pcall(function() MP:Layout() end) -- 皮肤覆写边色后立刻按状态刷回
 	end)
 
@@ -1192,7 +1841,7 @@ function MP:OnEvent()
 		buildIdIndex()
 		buildNameCands()
 		MP.loaded = 1
-		logMsg(L("v0.3.0 已加载, 等待初始化...", "v0.3.0 loaded, waiting for init..."))
+		logMsg(L("v0.4.0 已加载, 等待初始化...", "v0.4.0 loaded, waiting for init..."))
 	elseif event == "SPELLCAST_START" then
 		MP.Work.iSCasting = 1
 	elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_INTERRUPTED" or event == "SPELLCAST_FAILED" then
@@ -1212,6 +1861,10 @@ function MP.OnFrameUpdateInner()
 	local W = MP.Work
 	W.Time = W.Time + arg1
 	if W.Time < 2 then return end -- 启动后等客户端稳定 (临时附魔晚于插件加载)
+
+	if W.SwapQueue then
+		MP:ProcessSwapQueue() -- 换装双槽队列, 每帧检查 (0.25s 间隔)
+	end
 
 	if not W.SkinApplied and IsAddOnLoaded("pfUI") and pfUI and pfUI.api then
 		skinAllIcons()
@@ -1309,6 +1962,14 @@ local function mpSlash(arg1)
 		end
 	elseif string.sub(arg1, 1, 5) == "reset" then
 		MP:ResetPosition()
+	elseif string.sub(arg1, 1, 9) == "listmode " or arg1 == "listmode" then
+		local m = string.gsub(string.sub(arg1, 10), "%s", "")
+		if m == "all" or m == "stock" then
+			MPcfg.ListDefault = m
+			logMsg(L("右键列表默认: " .. (m == "stock" and "包里有货" or "全部可用"), "Menu default: " .. m))
+		else
+			logMsg(L("用法: /mpoison listmode stock|all", "Usage: /mpoison listmode stock|all"))
+		end
 	elseif arg1 == "" then
 		if MP.ConfigFrame and MP.ConfigFrame:IsVisible() then
 			MP.ConfigFrame:Hide()
@@ -1316,7 +1977,7 @@ local function mpSlash(arg1)
 			MP:Refresh(); MP.ConfigFrame:Show()
 		end
 	else
-		logMsg(L("命令: /mpoison 开关面板 | scale N | lock | unlock | pos x,y | time N | reset", "Usage: /mpoison toggle | scale N | lock | unlock | pos x,y | time N | reset"))
+		logMsg(L("命令: /mpoison 开关面板 | scale N | lock | unlock | pos x,y | time N | listmode stock|all | reset", "Usage: /mpoison toggle | scale N | lock | unlock | pos x,y | time N | listmode stock|all | reset"))
 	end
 end
 
