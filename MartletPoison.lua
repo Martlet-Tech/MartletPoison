@@ -207,6 +207,9 @@ local function initConfig()
 		}
 	end
 	if not MPcfg.TimeWarn then MPcfg.TimeWarn = 5 end
+	-- 存量存档迁移 (v0.3.x 升级): 新增字段补默认值
+	if not MPcfg.WeaponSets then MPcfg.WeaponSets = {} end
+	if not MPcfg.ListDefault then MPcfg.ListDefault = "stock" end
 end
 
 -- ==================== 背包扫描 ====================
