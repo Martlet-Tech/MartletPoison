@@ -697,6 +697,8 @@ function MP:UpdateSetSlot(set, hand, btn, needsScan)
 	btn.itemId = id
 	btn.Icon:SetTexture(set[prefix .. "Icon"] or "Interface\\Buttons\\UI-EmptySlot")
 
+	-- 背包扫描只做精修 (图标/毒类型); 显示以"装备期间回写的冻结数据"为准 —
+	-- 本客户端背包侧 tooltip 扫描不可靠, 不能作为唯一来源
 	local t, charges
 	if needsScan then
 		local bag, slot = MP:LocateSetWeapon(set, hand)
@@ -705,31 +707,37 @@ function MP:UpdateSetSlot(set, hand, btn, needsScan)
 			set[prefix .. "Icon"] = GetContainerItemInfo(bag, slot) or set[prefix .. "Icon"]
 			t, _, charges = MP:ScanBagWeapon(bag, slot)
 			if t then
-				set[prefix .. "Poison"] = t -- 毒类型跟武器走; 耗尽(扫不到)时保留记忆
+				set[prefix .. "Poison"] = t
+				if charges then set[prefix .. "Charges"] = charges end
 			end
 		end
 	end
 	local poison = set[prefix .. "Poison"] or 0
+	local chg = charges or set[prefix .. "Charges"]
 
-	if t then
-		btn.Poison:SetTexture(MP.Types[t].icon)
+	if poison > 0 then
+		btn.Poison:SetTexture(MP.Types[poison].icon)
 	else
-		btn.Poison:SetTexture(MP.RED_X_ICON) -- 没涂毒 / 毒已耗尽
+		btn.Poison:SetTexture(MP.RED_X_ICON) -- 没涂毒 (或从未装备校准过)
 	end
 	btn.Poison:Show()
 
-	if t and t <= 8 and charges and charges > 0 then
-		local max = MPcfg.MaxCharges[t] or 30
-		local col = pctColor(charges / max)
-		btn.cTL:SetText(tostring(charges)); btn.cTL:SetTextColor(col[1], col[2], col[3])
-	elseif t and t <= 8 then
-		btn.cTL:SetText("0"); btn.cTL:SetTextColor(COLOR_RED[1], COLOR_RED[2], COLOR_RED[3])
-	elseif t then
+	if poison > 0 and poison <= 8 then
+		if chg and chg > 0 then
+			local max = MPcfg.MaxCharges[poison] or 30
+			local col = pctColor(chg / max)
+			btn.cTL:SetText(tostring(chg)); btn.cTL:SetTextColor(col[1], col[2], col[3])
+		elseif chg and chg == 0 then
+			btn.cTL:SetText("0"); btn.cTL:SetTextColor(COLOR_RED[1], COLOR_RED[2], COLOR_RED[3])
+		else
+			btn.cTL:SetText("?"); btn.cTL:SetTextColor(COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3]) -- 未校准, 换上一次即准
+		end
+	elseif poison > 0 then
 		btn.cTL:SetText(MP.INF_CHAR); btn.cTL:SetTextColor(COLOR_GRAY[1], COLOR_GRAY[2], COLOR_GRAY[3])
 	else
 		btn.cTL:SetText("")
 	end
-	btn.cTR:SetText(t and "-" or "") -- 背包里的武器读不到剩余时间
+	btn.cTR:SetText("-") -- 背包里的武器读不到剩余时间
 	btn.cBR:SetText(tostring(MP.Work.bagIdCounts[id] or 0)); btn.cBR:SetTextColor(1, 1, 1)
 end
 
@@ -758,6 +766,30 @@ function MP:Refresh()
 	-- 记忆跟随真实状态: 附魔在 -> 记忆同步为它
 	if MP.Work.activeMH then MPcfg.LastMH = MP.Work.activeMH end
 	if MP.Work.activeOH then MPcfg.LastOH = MP.Work.activeOH end
+
+	-- 装备中的武器状态回写所属候选组 (装备侧扫描可靠; 收回背包后该组数据冻结显示)
+	local curMH, curOH = MP:EquippedWeaponIds()
+	for gi = 1, table.getn(MPcfg.WeaponSets) do
+		local set = MPcfg.WeaponSets[gi]
+		if set then
+			if (set.mhId or 0) ~= 0 and set.mhId == curMH then
+				if MP.Work.activeMH then
+					set.mhPoison = MP.Work.activeMH
+					set.mhCharges = MP.Work.slotInfo[3]
+				else
+					set.mhCharges = 0 -- 附魔没了 = 次数耗尽
+				end
+			end
+			if (set.ohId or 0) ~= 0 and set.ohId == curOH then
+				if MP.Work.activeOH then
+					set.ohPoison = MP.Work.activeOH
+					set.ohCharges = MP.Work.slotInfo[6]
+				else
+					set.ohCharges = 0
+				end
+			end
+		end
+	end
 
 	MP:BagScan()
 	MP:UpdateIcons(1)
