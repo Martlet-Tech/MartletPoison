@@ -383,6 +383,22 @@ function MP:FindBagItemById(id)
 	return nil
 end
 
+-- 找光标上物品的来源背包格: 物品被拿上光标时原格保持锁定 (本客户端无 GetCursorInfo)
+function MP:FindLockedBagSlot()
+	for i = 0, 4 do
+		local n = GetContainerNumSlots(i)
+		for j = 1, n do
+			if GetContainerItemInfo(i, j) then
+				local _, _, locked = GetContainerItemInfo(i, j)
+				if locked then
+					return i, j
+				end
+			end
+		end
+	end
+	return nil
+end
+
 -- 定位候选槽武器: 最近位置(位置上ID对得上优先) → 扫ID+期望毒匹配 → 任意同ID
 function MP:LocateSetWeapon(set, hand)
 	local prefix = (hand == "MH") and "mh" or "oh"
@@ -1414,16 +1430,10 @@ function MP:ConfigureUI()
 			local set = MPcfg.WeaponSets[btn.gi]
 			if not set then return end
 			local prefix = btn.prefix
-			-- 带武器点击 = 摆放/替换 (1.12 无拖放事件, 带物品点击 = OnClick + GetCursorInfo)
-			local ctype, ca, cb = GetCursorInfo()
-			if ctype == "item" then
+			-- 带武器点击 = 摆放/替换 (本客户端无 GetCursorInfo; 物品上光标时其原背包格保持锁定)
+			if CursorHasItem and CursorHasItem() then
+				local bag, slot = MP:FindLockedBagSlot()
 				ClearCursor() -- 物品放回原背包格
-				local bag, slot
-				if ca and cb and GetContainerItemLink(ca, cb) then
-					bag, slot = ca, cb
-				elseif type(ca) == "number" then
-					bag, slot = MP:FindBagItemById(ca)
-				end
 				if bag then
 					local link = GetContainerItemLink(bag, slot)
 					local _, _, idStr = string.find(link or "", "|Hitem:(%d+)")
