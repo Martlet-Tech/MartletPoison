@@ -322,7 +322,9 @@ local function scanParserLines()
 end
 
 -- 解析武器槽 tooltip, 返回 种类id, 等级序号
+-- 防崩溃: 槽位被锁 (换装 PickUp 进行中) 时绝不做 tooltip 扫描
 function MP:ScanHand(slot)
+	if IsInventoryItemLocked(slot) then return nil end
 	local parser = MP.Parser
 	parser:SetOwner(UIParent, "ANCHOR_NONE")
 	local ok = parser:SetInventoryItem("player", slot)
@@ -334,7 +336,10 @@ function MP:ScanHand(slot)
 end
 
 -- 解析背包里武器的 tooltip, 返回 种类id, 等级序号, 剩余次数 (候选武器槽角标用)
+-- 防崩溃: 背包格被锁 (光标持物/换装中) 时绝不做 tooltip 扫描
 function MP:ScanBagWeapon(bag, slot)
+	local _, _, locked = GetContainerItemInfo(bag, slot)
+	if locked then return nil end
 	local parser = MP.Parser
 	parser:SetOwner(UIParent, "ANCHOR_NONE")
 	local ok = parser:SetBagItem(bag, slot)
@@ -629,7 +634,9 @@ end
 
 -- ==================== 候选武器槽刷新 ====================
 function MP:UpdateSetUI(scanCands)
-	local setNeedsScan = scanCands or MP.Work.dirtySetSlots
+	-- 换装进行中/刚落定: 不扫候选武器状态 (物品在换位, tooltip 扫描有崩溃风险)
+	local settling = MP.Work.SwapQueue or (MP.Work.SwapSettleAt and GetTime() < MP.Work.SwapSettleAt)
+	local setNeedsScan = (scanCands or MP.Work.dirtySetSlots) and not settling
 	for gi = 1, table.getn(MPcfg.WeaponSets) do
 		local set = MPcfg.WeaponSets[gi]
 		local ui = MP.Work.SetUI.groups[gi]
@@ -709,6 +716,11 @@ function MP:UpdateSetSlot(set, hand, btn, needsScan)
 end
 
 function MP:Refresh()
+	-- 换装进行中/刚结束: 物品在换位, 此刻做任何 tooltip 扫描都可能崩客户端 → 推迟
+	if MP.Work.SwapQueue or (MP.Work.SwapSettleAt and GetTime() < MP.Work.SwapSettleAt) then
+		MP.Work.dirty = 1
+		return
+	end
 	local s1, s2, s3, s4, s5, s6, s7 = GetWeaponEnchantInfo()
 	MP.Work.slotInfo[1], MP.Work.slotInfo[2], MP.Work.slotInfo[3], MP.Work.slotInfo[4], MP.Work.slotInfo[5], MP.Work.slotInfo[6], MP.Work.slotInfo[7] =
 		s1, s2, s3, s4, s5, s6, s7
@@ -937,6 +949,7 @@ function MP:ProcessSwapQueue()
 	if GetTime() - (MP.Work.SwapStartedAt or 0) > 5 then
 		logMsg(L("换装超时中止 (槽位被锁?)", "Swap aborted (slot locked?)"))
 		MP.Work.SwapQueue = nil
+		MP.Work.SwapSettleAt = GetTime() + 0.5
 		return
 	end
 	if GetTime() < MP.Work.SwapNextAt then return end
@@ -955,6 +968,7 @@ function MP:ProcessSwapQueue()
 	table.remove(q, 1)
 	if table.getn(q) == 0 then
 		MP.Work.SwapQueue = nil
+		MP.Work.SwapSettleAt = GetTime() + 0.5 -- 换位落定前推迟一切 tooltip 扫描
 		-- 记忆跟武器走: 换上的组把它的"上次毒"带给看板
 		local set = MPcfg.WeaponSets[MP.Work.SwapSetIdx]
 		if set then
