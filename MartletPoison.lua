@@ -695,12 +695,14 @@ function MP:UpdateSetSlot(set, hand, btn, needsScan)
 		return
 	end
 	btn.itemId = id
-	btn.Icon:SetTexture(GetItemIcon(id) or "Interface\\Buttons\\UI-EmptySlot")
+	btn.Icon:SetTexture(set[prefix .. "Icon"] or "Interface\\Buttons\\UI-EmptySlot")
 
 	local t, charges
 	if needsScan then
 		local bag, slot = MP:LocateSetWeapon(set, hand)
 		if bag then
+			-- 本客户端无 GetItemIcon: 图标从背包格纹理取 (1.12 GetContainerItemInfo 首返回值)
+			set[prefix .. "Icon"] = GetContainerItemInfo(bag, slot) or set[prefix .. "Icon"]
 			t, _, charges = MP:ScanBagWeapon(bag, slot)
 			if t then
 				set[prefix .. "Poison"] = t -- 毒类型跟武器走; 耗尽(扫不到)时保留记忆
@@ -1440,6 +1442,7 @@ function MP:ConfigureUI()
 					if idStr then
 						set[prefix .. "Id"] = tonumber(idStr)
 						set[prefix .. "Bag"], set[prefix .. "Slot"] = bag, slot
+						set[prefix .. "Icon"] = GetContainerItemInfo(bag, slot) -- 1.12 首返回值=纹理
 						local t = MP:ScanBagWeapon(bag, slot)
 						if t then set[prefix .. "Poison"] = t end
 						MP.Work.dirtySetSlots = 1
